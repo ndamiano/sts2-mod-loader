@@ -4,6 +4,9 @@ browsing/searching the Workshop through its public browse page (no account or AP
 import json
 import os
 import re
+import ssl
+import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -38,6 +41,20 @@ def _save_cache(cache):
     os.replace(tmp, CACHE_PATH)
 
 
+_certificate_failed = [False]
+
+
+def certificate_failed():
+    """True if the last request to Steam failed certificate verification."""
+    return _certificate_failed[0]
+
+
+def _note_result(error=None):
+    """Remember whether a request to Steam failed because its certificate couldn't be verified."""
+    reason = getattr(error, "reason", error)
+    _certificate_failed[0] = isinstance(reason, ssl.SSLCertVerificationError)
+
+
 def fetch_details(workshop_ids, force=False):
     """Blocking. Returns {wid: details}. Uses the cache when fresh; never raises on network errors."""
     cache = load_cache()
@@ -53,9 +70,11 @@ def fetch_details(workshop_ids, force=False):
         req = urllib.request.Request(API, data=urllib.parse.urlencode(form).encode(),
                                      headers={"User-Agent": "sts2-mod-loader"})
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=TIMEOUT, context=osenv.ssl_context()) as resp:
                 items = json.load(resp)["response"]["publishedfiledetails"]
-        except (OSError, ValueError, KeyError):
+            _note_result()
+        except (OSError, ValueError, KeyError) as e:
+            _note_result(e)
             break
         for item in items:
             if str(item.get("result")) != "1":
@@ -119,10 +138,12 @@ def browse(query="", sort="trend", page=1):
     req = urllib.request.Request(BROWSE + "?" + urllib.parse.urlencode(params),
                                  headers={"User-Agent": "sts2-mod-loader", "Accept-Language": "en"})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=osenv.ssl_context()) as resp:
             html = resp.read(16 * 1024 * 1024).decode("utf-8", "replace")
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        _note_result(e)
         return None
+    _note_result()
     return parse_browse(html)
 
 
@@ -154,26 +175,189 @@ def english_ratio(details):
     return sum(c.isascii() for c in letters) / len(letters)
 
 
+def _have_pillow():
+    try:
+        import PIL.Image  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _is_jpeg(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(3) == b"\xff\xd8\xff"
+    except OSError:
+        return False
+
+
+def _download(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "sts2-mod-loader"})
+    with urllib.request.urlopen(req, timeout=TIMEOUT, context=osenv.ssl_context()) as resp:
+        return resp.read(8 * 1024 * 1024)
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _convert_with_os(jpeg, out, max_side):
+    """Turn JPEG bytes into a PNG file with an image converter the system already has.
+    macOS always has `sips`; elsewhere there's none to rely on (the Windows build bundles
+    Pillow). Returns True on success."""
+    if not osenv.IS_MAC:
+        return False
+    src = out + ".src.jpg"
+    try:
+        with open(src, "wb") as f:
+            f.write(jpeg)
+        subprocess.run(["sips", "-s", "format", "png", "-Z", str(max_side), src, "--out", out],
+                       capture_output=True, timeout=20)
+        with open(out, "rb") as f:
+            return f.read(8) == PNG_MAGIC
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
+
+THUMB_PX = 96        # list rows show 52px
+PREVIEW_PX = 168     # details panes show 168px
+# The size Steam's own Workshop pages ask for, so the image server nearly always has it ready
+# (~0.1s, ~120KB). Other sizes are made on demand and can take seconds; plain originals are
+# often 1000px+ and several hundred KB.
+STEAM_SIZE = "ima=fit&impolicy=Letterbox&imcolor=%23000000&imw=322&imh=322&letterbox=true"
+CACHE_DAYS = 7
+
+
+def _fresh(path):
+    return os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_DAYS * 86400
+
+
+def thumb_cache_path(wid):
+    return os.path.join(PREVIEW_DIR, f"{wid}.thumb")
+
+
+def _source(wid, url):
+    """One download per item: Steam's 322px version, kept as is. Returns the path."""
+    path = os.path.join(PREVIEW_DIR, f"{wid}.322")
+    if not _fresh(path):
+        data = _download(url + ("&" if "?" in url else "?") + STEAM_SIZE)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:      # several downloads run at once: never expose half a file
+            f.write(data)
+        _replace(tmp, path)
+    return path
+
+
+def _replace(tmp, path):
+    """os.replace, allowing for Windows: it refuses while another thread has `path` open (to
+    show the picture, or finishing the same download). Retry briefly; if it's still in use,
+    the copy that's already there is as good as ours."""
+    for attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if not os.path.exists(path):
+        raise PermissionError(f"couldn't write {path}")
+
+
+PRUNE_DAYS = 30      # pictures not used for this long are removed from the cache
+
+
+def prune_previews(max_age_days=PRUNE_DAYS):
+    """Keep the picture cache small. Removes, from PREVIEW_DIR only (no subfolders):
+    files left by older versions (<id>.img and their shrunk copies), icons and previews
+    whose 322px source is gone, half-written temp files older than an hour, and anything
+    not used for max_age_days. Returns (files removed, bytes freed)."""
+    try:
+        names = os.listdir(PREVIEW_DIR)
+    except OSError:
+        return 0, 0
+    now = time.time()
+    present = set(names)
+    removed = freed = 0
+    for name in names:
+        path = os.path.join(PREVIEW_DIR, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not os.path.isfile(path):
+            continue
+        age = now - st.st_mtime
+        base = name.split(".", 1)[0]
+        rest = name[len(base):]                       # ".322", ".thumb.52x52.png", ...
+        stem = name.rsplit(".", 2)[0] if name.endswith(".png") and rest.count(".") >= 2 else None
+        if rest.startswith(".img"):
+            stale = True                              # older versions' full-size pictures
+        elif rest.endswith((".tmp", ".src.jpg")):
+            stale = age > 3600                        # interrupted download or conversion
+        elif rest.startswith((".thumb", ".preview")):
+            stale = f"{base}.322" not in present      # made from a source that's gone
+        elif stem and rest.startswith(".322."):
+            stale = stem not in present               # shrunk copy of a source that's gone
+        else:
+            stale = False
+        if stale or age > max_age_days * 86400:
+            try:
+                os.remove(path)
+                removed += 1
+                freed += st.st_size
+            except OSError:
+                pass
+    return removed, freed
+
+
 def preview_path(wid, url, thumb=False):
-    """Blocking download of a preview image into the cache. Returns a local path or None.
-    thumb asks Steam's image server for a small version (for list rows)."""
+    """Blocking: a local image for a Workshop item's preview, for a list row (thumb) or a
+    details pane. Returns a path load_image can show, or None.
+
+    Both come from one small download (_source). Most are JPEG, which Tk can only show with
+    Pillow: with Pillow (or when Steam sent a PNG) that file is used directly. Without it,
+    macOS makes a PNG of the right size with sips; elsewhere ask the image server for a
+    PNG (imformat=png, full size; load_image shrinks and caches it). The server refuses that
+    for some images; then the JPEG itself is returned and needs_pillow() is true for it."""
     if not url:
         return None
     os.makedirs(PREVIEW_DIR, exist_ok=True)
-    path = os.path.join(PREVIEW_DIR, f"{wid}.thumb" if thumb else f"{wid}.img")
-    if thumb:
-        url += ("&" if "?" in url else "?") + "imw=96&imh=96&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=true"
-    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 7 * 86400:
-        return path
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "sts2-mod-loader"})
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = resp.read(8 * 1024 * 1024)
-        with open(path, "wb") as f:
-            f.write(data)
-        return path
+        src = _source(wid, url)
+        if _have_pillow() or not _is_jpeg(src):
+            return src
+        out = thumb_cache_path(wid) if thumb else os.path.join(PREVIEW_DIR, f"{wid}.preview")
+        if _fresh(out) and not _is_jpeg(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+            return out
+        with open(src, "rb") as f:
+            jpeg = f.read()
+        if _convert_with_os(jpeg, out, THUMB_PX if thumb else PREVIEW_PX):
+            return out
+        png = _download(url + ("&" if "?" in url else "?") + "imformat=png")
+        if png[:8] == PNG_MAGIC:
+            with open(out, "wb") as f:
+                f.write(png)
+            return out
+        return src                     # a JPEG only Pillow can show: needs_pillow(src)
     except OSError:
-        return path if os.path.exists(path) else None
+        return None
+
+
+def needs_pillow(path):
+    """True for a downloaded picture that can't be shown because Pillow isn't installed."""
+    return bool(path) and not _have_pillow() and _is_jpeg(path)
+
+
+PILLOW_HINT = ("Some pictures can't be shown because Pillow isn't installed. Install it with "
+               + ("py -m pip install pillow" if osenv.IS_WINDOWS else "python3 -m pip install pillow")
+               + " and restart the app.")
 
 
 _BB = [

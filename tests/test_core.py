@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -29,6 +30,18 @@ def manifest(mod_id, deps=(), **extra):
             "dependencies": [{"id": d} for d in deps]}
     data.update(extra)
     return json.dumps(data)
+
+
+def can_symlink():
+    """Windows only allows symlinks with Developer Mode on or as admin."""
+    tmp = tempfile.mkdtemp(prefix="sts2ml-link-")
+    try:
+        os.symlink(tmp, os.path.join(tmp, "link"))
+        return True
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 class FakeGame(game_mod.Game):
@@ -131,6 +144,7 @@ class TestShortFileNames(Sandbox):
     """Encrypted home folders cap file names at 143 characters. The fix moves the game's whole
     data folder to an unencrypted disk and links it back."""
 
+    @unittest.skipUnless(can_symlink(), "can't create symlinks (Windows without Developer Mode)")
     def test_relocate_user_data(self):
         base = os.path.join(self.tmp, "unencrypted")
         os.makedirs(base)
@@ -270,6 +284,42 @@ class TestProfiles(Sandbox):
         code = profiles.share_code({"Lib": True, "Char": False, "Mine": True}, mods, self.game)
         self.assertEqual({m["workshop_id"] for m in profiles.parse_share_code(code)["mods"]}, {"1", "3"})
 
+    def test_profiles_are_alphabetical(self):
+        self.add_workshop_mod("1", "Lib")
+        mods = mods_mod.scan(self.game)
+        for name in ("friend", "Temp", "10", "2", "Default", "co-op 12", "Co-op 3"):
+            profiles.save_profile(name, {"Lib": True}, ["Lib"], mods)
+        self.assertEqual(profiles.list_profiles(),
+                         ["2", "10", "Co-op 3", "co-op 12", "Default", "friend", "Temp"])
+
+    def test_active_profile_matching(self):
+        self.add_workshop_mod("1", "Lib")
+        self.add_workshop_mod("2", "Char")
+        self.add_workshop_mod("3", "Mine")
+        mods = mods_mod.scan(self.game)
+        order = ["Lib", "Char", "Mine"]
+        profiles.save_profile("Solo", {"Lib": True, "Char": False, "Mine": True}, order, mods)
+        solo = profiles.load_profile("Solo")
+        self.assertTrue(profiles.matches(solo, {"Lib": True, "Char": False, "Mine": True}, order, mods))
+        self.assertFalse(profiles.matches(solo, {"Lib": True, "Char": True, "Mine": True}, order, mods))
+        self.assertFalse(profiles.matches(solo, {"Lib": True, "Char": False, "Mine": True},
+                                          ["Char", "Lib", "Mine"], mods))
+        # a mod installed after saving comes out disabled when the profile loads
+        self.add_workshop_mod("4", "New")
+        mods = mods_mod.scan(self.game)
+        states, new_order = profiles.profile_setup(solo, mods, order + ["New"])
+        self.assertFalse(states["New"])
+        self.assertEqual(new_order, order + ["New"])
+        self.assertFalse(profiles.matches(solo, {"Lib": True, "Char": False, "Mine": True, "New": True},
+                                          order + ["New"], mods))
+        # the active name is remembered, and never listed as a profile
+        self.assertIsNone(profiles.get_active())
+        profiles.set_active("Solo")
+        self.assertEqual(profiles.get_active(), "Solo")
+        self.assertEqual(profiles.list_profiles(), ["Solo"])
+        profiles.set_active(None)
+        self.assertIsNone(profiles.get_active())
+
 
 class TestShareCode(Sandbox):
     def test_roundtrip_inside_chat_message(self):
@@ -352,6 +402,203 @@ class TestApiCheckOnRealGame(unittest.TestCase):
             res = apicheck.check_mods(mods, g)
         self.assertTrue(res)
         self.assertFalse([mid for mid, r in res.items() if r.error], "metadata parse errors")
+
+
+class TestSslContext(unittest.TestCase):
+    def setUp(self):
+        from sts2mods import osenv
+        self.osenv = osenv
+
+    def test_missing_only_on_a_mac_python_without_certificates(self):
+        with mock.patch.object(self.osenv, "IS_MAC", True), \
+                mock.patch.object(self.osenv, "_python_has_ca_certs", return_value=False):
+            self.assertTrue(self.osenv.certificates_missing())
+        with mock.patch.object(self.osenv, "IS_MAC", True), \
+                mock.patch.object(self.osenv, "_python_has_ca_certs", return_value=True):
+            self.assertFalse(self.osenv.certificates_missing())
+        with mock.patch.object(self.osenv, "IS_MAC", False), \
+                mock.patch.object(self.osenv, "_python_has_ca_certs", return_value=False):
+            self.assertFalse(self.osenv.certificates_missing())
+
+    def test_uses_pythons_own_settings(self):
+        ctx = self.osenv.ssl_context()
+        self.assertIs(ctx, self.osenv.ssl_context())
+        self.assertEqual(ctx.verify_mode, __import__("ssl").CERT_REQUIRED)
+
+
+class TestPreviewConversion(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only (sips)")
+    def test_jpeg_becomes_png_with_sips(self):
+        import subprocess
+        d = tempfile.mkdtemp()
+        png = os.path.join(d, "src.png")
+        # build a valid 40x30 RGB PNG, turn it into a JPEG with sips, then back with the helper
+        import struct, zlib
+        w, h = 40, 30
+        raw = b"".join(b"\x00" + b"".join(bytes((x * 6, y * 8, 120)) for x in range(w)) for y in range(h))
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        with open(png, "wb") as f:
+            f.write(workshop.PNG_MAGIC + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+                    chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        jpg = os.path.join(d, "src.jpg")
+        subprocess.run(["sips", "-s", "format", "jpeg", png, "--out", jpg], capture_output=True, check=True)
+        with open(jpg, "rb") as f:
+            jpeg = f.read()
+        self.assertEqual(jpeg[:3], b"\xff\xd8\xff")
+        out = os.path.join(d, "out.thumb")
+        self.assertTrue(workshop._convert_with_os(jpeg, out, 96))
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(8), workshop.PNG_MAGIC)
+        self.assertFalse(os.path.exists(out + ".src.jpg"))
+
+    def test_no_converter_off_mac(self):
+        with mock.patch.object(workshop.osenv, "IS_MAC", False):
+            self.assertFalse(workshop._convert_with_os(b"\xff\xd8\xff", os.path.join(tempfile.mkdtemp(), "x"), 96))
+
+
+class TestNeedsPillow(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.jpeg = os.path.join(self.d, "1.322")
+        with open(self.jpeg, "wb") as f:
+            f.write(b"\xff\xd8\xff jpeg")
+
+    def test_only_a_jpeg_without_pillow(self):
+        png = os.path.join(self.d, "2.322")
+        with open(png, "wb") as f:
+            f.write(workshop.PNG_MAGIC)
+        with mock.patch.object(workshop, "_have_pillow", return_value=False):
+            self.assertTrue(workshop.needs_pillow(self.jpeg))
+            self.assertFalse(workshop.needs_pillow(png))
+            self.assertFalse(workshop.needs_pillow(None))
+        with mock.patch.object(workshop, "_have_pillow", return_value=True):
+            self.assertFalse(workshop.needs_pillow(self.jpeg))
+
+    def _preview(self, **source):
+        with mock.patch.object(workshop, "PREVIEW_DIR", self.d), mock.patch.object(workshop, "_have_pillow", return_value=False), \
+                mock.patch.object(workshop, "_convert_with_os", return_value=False), \
+                mock.patch.object(workshop, "_source", **source), \
+                mock.patch.object(workshop, "_download", return_value=b"\xff\xd8\xff refused"):
+            return workshop.preview_path("1", "https://img.example/x/", thumb=True)
+
+    def test_a_refused_picture_comes_back_as_the_jpeg(self):
+        path = self._preview(return_value=self.jpeg)
+        self.assertEqual(path, self.jpeg)
+
+    def test_a_failed_download_is_not_reported_as_needing_pillow(self):
+        self.assertIsNone(self._preview(side_effect=OSError("offline")))
+
+
+class TestCertificateFailure(unittest.TestCase):
+    def setUp(self):
+        workshop._note_result()
+        self.addCleanup(workshop._note_result)
+
+    def _browse(self, error):
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            return workshop.browse("anything")
+
+    def test_a_rejected_certificate_is_recognised(self):
+        import ssl
+        import urllib.error
+        self.assertIsNone(self._browse(urllib.error.URLError(ssl.SSLCertVerificationError(1, "bad"))))
+        self.assertTrue(workshop.certificate_failed())
+
+    def test_being_offline_is_not_a_certificate_problem(self):
+        import urllib.error
+        self.assertIsNone(self._browse(urllib.error.URLError(OSError("offline"))))
+        self.assertFalse(workshop.certificate_failed())
+
+    def test_a_later_success_clears_it(self):
+        import io
+        import ssl
+        import urllib.error
+        self._browse(urllib.error.URLError(ssl.SSLCertVerificationError(1, "bad")))
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(b"<html></html>")
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            self.assertEqual(workshop.browse("anything"), ([], None))
+        self.assertFalse(workshop.certificate_failed())
+
+    def test_details_requests_are_checked_too(self):
+        import ssl
+        import urllib.error
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError(ssl.SSLCertVerificationError(1, "bad"))), \
+                mock.patch.object(workshop, "load_cache", return_value={}), mock.patch.object(workshop, "_save_cache"):
+            workshop.fetch_details(["123"], force=True)
+        self.assertTrue(workshop.certificate_failed())
+
+
+class TestPrunePreviews(unittest.TestCase):
+    def test_removes_only_what_it_should(self):
+        d = tempfile.mkdtemp()
+        sub = os.path.join(d, "keep-me-folder")
+        os.makedirs(sub)
+        old = time.time() - 40 * 86400
+        files = {
+            "1.322": None, "1.thumb": None, "1.thumb.52x52.png": None, "1.preview": None,   # current: keep
+            "1.322.52x52.png": None,                                                          # copy of a source that exists: keep
+            "2.img": None, "2.img.168x168.png": None,                                         # older versions: remove
+            "3.thumb": None, "3.thumb.52x52.png": None, "3.preview": None,                    # no 3.322: remove
+            "4.322.52x52.png": None,                                                          # copy of a missing source: remove
+            "5.322.123.456.tmp": None,                                                        # fresh temp file: keep
+            "6.322.1.2.tmp": "old", "6.preview.src.jpg": "old",                               # old temp files: remove
+            "7.322": "old", "7.thumb": "old",                                                 # unused for 40 days: remove
+        }
+        for name, age in files.items():
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(b"x" * 10)
+            if age:
+                os.utime(os.path.join(d, name), (old, old))
+        with mock.patch.object(workshop, "PREVIEW_DIR", d):
+            removed, freed = workshop.prune_previews()
+        left = sorted(os.listdir(d))
+        self.assertEqual(left, sorted(["1.322", "1.thumb", "1.thumb.52x52.png", "1.preview", "1.322.52x52.png",
+                                       "5.322.123.456.tmp", "keep-me-folder"]))
+        self.assertEqual((removed, freed), (10, 100))
+        self.assertTrue(os.path.isdir(sub))
+
+    def test_missing_folder(self):
+        with mock.patch.object(workshop, "PREVIEW_DIR", os.path.join(tempfile.mkdtemp(), "nope")):
+            self.assertEqual(workshop.prune_previews(), (0, 0))
+
+
+class TestReplaceInUse(unittest.TestCase):
+    """Windows refuses to replace a file another thread has open; the download must cope."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.src, self.dest = os.path.join(self.tmp, "new.tmp"), os.path.join(self.tmp, "pic.322")
+        write(self.src, "new")
+
+    def test_retries_until_the_file_is_free(self):
+        real, calls = os.replace, []
+
+        def busy_twice(a, b):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError("in use")
+            real(a, b)
+        with mock.patch.object(workshop.os, "replace", busy_twice), mock.patch.object(workshop.time, "sleep"):
+            workshop._replace(self.src, self.dest)
+        self.assertEqual(read(self.dest), "new")
+
+    def test_keeps_the_existing_copy_when_still_in_use(self):
+        write(self.dest, "old")
+        with mock.patch.object(workshop.os, "replace", side_effect=PermissionError("in use")), \
+                mock.patch.object(workshop.time, "sleep"):
+            workshop._replace(self.src, self.dest)
+        self.assertEqual(read(self.dest), "old")
+        self.assertFalse(os.path.exists(self.src))
+
+    def test_fails_when_nothing_could_be_written(self):
+        with mock.patch.object(workshop.os, "replace", side_effect=PermissionError("in use")), \
+                mock.patch.object(workshop.time, "sleep"):
+            with self.assertRaises(OSError):
+                workshop._replace(self.src, self.dest)
 
 
 if __name__ == "__main__":

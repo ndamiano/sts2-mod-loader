@@ -6,8 +6,8 @@ anything: it reads the game's own files and edits only the game's `settings.save
 same file the in-game mod menu writes.
 
 Pure Python 3 with Tk (Python's built-in window toolkit). One codebase for every OS, no
-.NET. [Pillow](https://pypi.org/project/pillow/) is optional: with it installed, Workshop
-previews that are JPEGs show up too.
+.NET. [Pillow](https://pypi.org/project/pillow/) is optional, but without it some Workshop
+pictures can't be shown: the *Get mods* page says so when that happens.
 
 Dark theme by default. Set `STS2ML_THEME=light` for light, or `STS2ML_THEME=auto` to follow
 the desktop.
@@ -32,15 +32,20 @@ Or run `./sts2-mod-loader` directly.
 
 **macOS**
 
-1. Install Python 3 from [python.org](https://www.python.org/downloads/). Apple's built-in
-   Python has an outdated Tk that draws badly. With Homebrew, `brew install python-tk` works too.
+1. Install Python with Tk from [Homebrew](https://brew.sh): `brew install python-tk`. Apple's
+   built-in Python has an outdated Tk that draws badly.
 2. Double-click `STS2 Mod Loader.command`. The first time, macOS may ask you to allow it:
    right-click it → Open.
+
+Python from [python.org](https://www.python.org/downloads/) works too, but it starts without
+trusted certificates, so the Workshop can't be reached: run **Install Certificates.command** in its
+folder in Applications once. The app tells you if this is needed.
 
 ## What it does
 
 - **One list of every mod**, from Steam Workshop and the game's local `mods/` folder,
-  with search, filters (problems, enabled, unapplied changes…) and sorting.
+  with search, filters (current mods, problems, unapplied changes…) and sorting. The view
+  you used last is remembered.
 - **Health check for every mod**, from three sources:
   - **Code check.** Each mod's compiled code is compared against *your installed*
     `sts2.dll` and library mods (BaseLib, RitsuLib…). If a mod calls a game function
@@ -59,9 +64,14 @@ Or run `./sts2-mod-loader` directly.
   and every write makes a backup you can restore from the menu.
 - **Profiles.** Save and load named setups ("Solo", "Co-op with Sam"), including load
   order.
-- **Co-op compare.** *Copy my mod list code* puts one line of text on your clipboard
+- **Load order.** Sort by load order and drag mods up or down the list, or use the ▲▼
+  buttons on a mod (Alt+↑/↓, Option+↑/↓ on macOS).
+- **Keyboard.** ↑/↓ move through the list (Page Up/Down, Home/End jump), Space enables or
+  disables the selected mod, Enter applies, Esc clears the search or the selection,
+  Ctrl+F (⌘F) searches, Ctrl+S (⌘S) applies, F5 rescans.
+- **Co-op compare.** **Copy mod list** puts one line of text on your clipboard
   (`STS2:…`, about 100 characters for 8 mods, under 500 for 60). Paste it in Discord or wherever; your friend
-  opens *Compare with a friend's code* (it picks the code up from the clipboard) to see
+  presses **Import mod list** (it picks the code up from the clipboard) to see
   the branch/version differences and the mods to subscribe to, enable or disable.
   *Subscribe to all* gets the missing ones and *Match their setup* stages the rest.
 - **Get mods.** The *Get mods* tab browses and searches the Workshop (trending, most

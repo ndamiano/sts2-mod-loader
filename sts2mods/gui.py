@@ -1,8 +1,10 @@
 """Tk front end. Runs the same on Linux, Windows and macOS with only Python's standard library
 (Pillow, if installed, adds JPEG previews)."""
 
+import json
 import os
 import queue
+from collections import OrderedDict
 import sys
 import threading
 import time
@@ -15,9 +17,9 @@ from . import game as game_mod
 from . import mods as mods_mod
 from . import settings as settings_mod
 from .logscan import S_ERROR, S_OK, S_STALE, S_UNTESTED, S_WARN, STATUS_RANK
-from .ui import (C, F, Dialog, InfoBar, Pill, ReadOnlyText, ScrollFrame, SearchEntry, Select, Spinner,
+from .ui import (C, F, CheckList, ChoiceList, Dialog, InfoBar, Pill, PopupMenu, ReadOnlyText, ScrollFrame, SearchEntry, Select, Spinner,
                  Toggle, Tooltip, WrapLabel, apply_theme, app_icon, badge, blend, install_wheel,
-                 load_image, soft)
+                 load_image, px, soft)
 
 S_CHECKING = "checking"
 STATUS_TEXT = {
@@ -35,12 +37,36 @@ def status_color(status):
     return {S_ERROR: C["error"], S_WARN: C["warn"], S_STALE: C["stale"], S_OK: C["ok"]}.get(status, C["faint"])
 
 
-FILTERS = [("all", "All mods"), ("enabled", "Enabled"), ("disabled", "Disabled"),
+FILTERS = [("all", "All mods"), ("current", "Current mods"), ("disabled", "Disabled"),
            ("problems", "Problems"), ("changed", "Unapplied changes"),
            ("workshop", "Workshop"), ("local", "Local folder")]
 SORTS = [("name", "Sort: Name"), ("status", "Sort: Status"), ("order", "Sort: Load order"),
          ("updated", "Sort: Recently updated"), ("size", "Sort: Size")]
 MOD = "Command" if osenv.IS_MAC else "Control"
+DEFAULT_FILTER = "all"     # the first start shows everything; the last view picked is remembered
+UI_PREFS_PATH = os.path.join(osenv.config_dir(), "ui.json")   # small view preferences
+
+
+def load_ui_prefs():
+    try:
+        with open(UI_PREFS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ui_pref(key, value):
+    prefs = load_ui_prefs()
+    prefs[key] = value
+    try:
+        os.makedirs(os.path.dirname(UI_PREFS_PATH), exist_ok=True)
+        tmp = UI_PREFS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+        os.replace(tmp, UI_PREFS_PATH)
+    except OSError:
+        pass
 
 
 def human_size(n):
@@ -104,6 +130,19 @@ class Worker:
             pass
         if not cls.closing:
             root.after(40, cls.pump, root)
+
+
+class WorkerPool:
+    """Several Workers sharing jobs round-robin, so independent downloads (Workshop
+    pictures) run side by side instead of one after another."""
+
+    def __init__(self, name, size):
+        self.workers = [Worker(f"{name}-{i}") for i in range(size)]
+        self.next = 0
+
+    def submit(self, fn, callback):
+        self.workers[self.next].submit(fn, callback)
+        self.next = (self.next + 1) % len(self.workers)
 
 
 # ------------------------------------------------------------------------------------------
@@ -202,9 +241,10 @@ class State:
 class Row(tk.Frame):
     """A selectable list row with hover and selection colors."""
 
-    def __init__(self, parent, on_select):
-        super().__init__(parent, bg=C["surface"], cursor="hand2")
+    def __init__(self, parent, on_select, on_drag=None):
+        super().__init__(parent, bg=C["surface"])
         self.on_select, self.selected, self.hovered = on_select, False, False
+        self.on_drag = on_drag        # on_drag(kind, event) with kind press / motion / release
         self.stripe = tk.Frame(self, bg=C["surface"], width=3)
         self.stripe.pack(side="left", fill="y")
         self.inner = tk.Frame(self, bg=C["surface"], padx=10, pady=8)
@@ -219,7 +259,11 @@ class Row(tk.Frame):
             bound.add(str(w))
             w.bind("<Button-1>", lambda e: self.on_select(), add="+")
             w.bind("<Enter>", lambda e: self._hover(True), add="+")
-            w.bind("<Leave>", lambda e: self._hover(False), add="+")
+            w.bind("<Leave>", lambda e: self.after_idle(self._check_leave), add="+")
+            if self.on_drag:
+                w.bind("<ButtonPress-1>", lambda e: self.on_drag("press", e), add="+")
+                w.bind("<B1-Motion>", lambda e: self.on_drag("motion", e), add="+")
+                w.bind("<ButtonRelease-1>", lambda e: self.on_drag("release", e), add="+")
 
     def _descendants(self, w):
         out = []
@@ -227,6 +271,18 @@ class Row(tk.Frame):
             out.append(c)
             out += self._descendants(c)
         return out
+
+    def _check_leave(self):
+        """Moving between a row's own labels fires Leave then Enter; only un-hover when the
+        pointer really left the row."""
+        try:
+            w = self.winfo_containing(*self.winfo_pointerxy())
+        except (tk.TclError, KeyError):
+            w = None
+        while w is not None and w is not self:
+            w = getattr(w, "master", None)
+        if w is None:
+            self._hover(False)
 
     def _hover(self, on):
         if on != self.hovered:
@@ -251,14 +307,51 @@ class Row(tk.Frame):
 
 
 class Details:
-    """Helpers for building a details pane inside a ScrollFrame."""
+    """Helpers for building a details pane inside a ScrollFrame.
 
-    def __init__(self, scroll):
+    With cache_size > 0, each page is built in its own frame and the last few are kept, so
+    going back to a page shows it instantly instead of rebuilding every widget. A page is
+    reused only while its `gen` matches (callers bump gen whenever the data changes)."""
+
+    def __init__(self, scroll, cache_size=0):
         self.scroll = scroll
         self.d = scroll.body
+        self.cache_size = cache_size
+        self.cache = OrderedDict()      # key -> (gen, frame)
+        self.current = None
 
-    def clear(self):
-        self.scroll.clear()
+    def clear(self, key=None, gen=None):
+        if not self.cache_size:
+            self.scroll.clear()
+            return
+        if self.current is not None:
+            self.current.pack_forget()
+        key = ("page", key)
+        old = self.cache.pop(key, None)
+        if old:
+            old[1].destroy()
+        for k in [k for k, (g, _) in self.cache.items() if g != gen]:
+            self.cache.pop(k)[1].destroy()
+        while len(self.cache) >= self.cache_size:
+            self.cache.popitem(last=False)[1][1].destroy()
+        frame = tk.Frame(self.scroll.body, bg=C["surface"])
+        frame.pack(fill="x")
+        self.cache[key] = (gen, frame)
+        self.d = self.current = frame
+        self.scroll.to_top()
+
+    def show_cached(self, key, gen):
+        """Show a remembered page. Returns False if it has to be built (again)."""
+        entry = self.cache.get(("page", key))
+        if not self.cache_size or not entry or entry[0] != gen:
+            return False
+        if self.current is not None and self.current is not entry[1]:
+            self.current.pack_forget()
+        self.cache.move_to_end(("page", key))
+        self.d = self.current = entry[1]
+        self.current.pack(fill="x")
+        self.scroll.to_top()
+        return True
 
     def title(self, text, parent=None):
         lb = WrapLabel(parent or self.d, text, font=F["title"])
@@ -309,7 +402,7 @@ class Details:
 
 class ResultRow(Row):
     def __init__(self, page, parent, wid):
-        super().__init__(parent, lambda: page.select(wid))
+        super().__init__(parent, lambda: (page.list.canvas.focus_set(), page.select(wid)))
         self.page, self.wid, self.photo = page, wid, None
         self.blank = tk.PhotoImage(width=52, height=52)
         self.thumb = tk.Label(self.inner, image=self.blank, bg=C["surface2"], bd=0)
@@ -365,7 +458,6 @@ class BrowsePage(tk.Frame):
         self.gen = 0
         self.started = False
         self.selected = None
-        self.thumbs = Worker("thumbnails")
 
         bar = tk.Frame(self, bg=C["surface"], padx=14, pady=10)
         bar.pack(fill="x")
@@ -380,9 +472,11 @@ class BrowsePage(tk.Frame):
         self.status = tk.Label(bar, text="", fg=C["dim"], bg=C["surface"], font=F["small"])
         self.status.pack(side="left", padx=(6, 0))
         tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+        self.pillow_notice = InfoBar(self, "info")      # shown once a picture needs Pillow
+        self.pillow_notice.label.configure(text=workshop.PILLOW_HINT)
 
-        paned = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg=C["border"], bd=0,
-                               sashrelief="flat", showhandle=False, opaqueresize=True)
+        self.paned = paned = tk.PanedWindow(self, orient="horizontal", sashwidth=5, bg=C["border"], bd=0,
+                                            sashrelief="flat", showhandle=False, opaqueresize=True)
         paned.pack(fill="both", expand=True)
         self.list = ScrollFrame(paned)
         self.placeholder = tk.Label(self.list.body, text="", fg=C["faint"], bg=C["surface"], font=F["hint"],
@@ -390,8 +484,8 @@ class BrowsePage(tk.Frame):
         self.more = Pill(self.list.body, "Load more", lambda: self.load_page(self.page_no + 1))
         self.details = ScrollFrame(paned, padx=28, pady=22)
         self.dt = Details(self.details)
-        paned.add(self.list, minsize=320, width=460, stretch="never")
-        paned.add(self.details, minsize=360, stretch="always")
+        paned.add(self.list, minsize=px(320), width=px(460), stretch="never")
+        paned.add(self.details, minsize=px(360), stretch="always")
         self.show_intro()
 
     # ---- searching -----------------------------------------------------------------------
@@ -425,7 +519,7 @@ class BrowsePage(tk.Frame):
         gen = self.gen
         query = self.search.value()
         sort = self.sort.key()
-        self.sort.configure(state="disabled" if query else "readonly")
+        self.sort.set_enabled(not query)
         self.more.set_enabled(False)
         self.spinner.start()
         self._placeholder("Searching the Workshop…" if query else "Loading the Workshop…")
@@ -447,8 +541,10 @@ class BrowsePage(tk.Frame):
                 return
             self.spinner.stop()
             self.more.set_enabled(True)
+            self.win.sync_certificate_notice()
             if result is None:
-                self._placeholder("Couldn't reach the Steam Workshop. Check your connection, then press "
+                self._placeholder(self.win.certificate_help() or
+                                  "Couldn't reach the Steam Workshop. Check your connection, then press "
                                   "Enter in the search box to try again.")
                 return
             ids, got_any, total, info = result
@@ -490,7 +586,13 @@ class BrowsePage(tk.Frame):
                 img = load_image(path, 52, 52)
                 if img:
                     row.set_thumb(img)
-        self.thumbs.submit(lambda: workshop.preview_path(row.wid, url, thumb=True), done)
+                elif workshop.needs_pillow(path):
+                    self._show_pillow_notice()
+        self.win.pictures.submit(lambda: workshop.preview_path(row.wid, url, thumb=True), done)
+
+    def _show_pillow_notice(self):
+        if not self.pillow_notice.winfo_manager():
+            self.pillow_notice.pack(fill="x", before=self.paned)
 
     def refresh_installed(self):
         for row in self.rows.values():
@@ -589,14 +691,7 @@ class BrowsePage(tk.Frame):
         self.details.to_top()
 
     def _load_preview(self, wid, url, target, head):
-        def done(path):
-            if path and target.winfo_exists():
-                img = load_image(path, 168, 168)
-                if img:
-                    target.image = img
-                    target.configure(image=img)
-                    target.pack(side="left", padx=(0, 20), before=head.winfo_children()[1])
-        self.win.net.submit(lambda: workshop.preview_path(wid, url), done)
+        self.win.show_preview(wid, url, target, head)
 
 
 # ------------------------------------------------------------------------------------------
@@ -605,8 +700,11 @@ class BrowsePage(tk.Frame):
 
 class ModRow(Row):
     def __init__(self, win, parent, mod_id):
-        super().__init__(parent, lambda: win.select(mod_id))
+        super().__init__(parent, lambda: win.select(mod_id, focus_list=True),
+                         on_drag=lambda kind, e: win.drag_event(mod_id, kind, e))
         self.win, self.mod_id = win, mod_id
+        self.grip = tk.Label(self.inner, text="≡", font=F["dot"], fg=C["faint"], bg=C["surface"],
+                             cursor="sb_v_double_arrow", padx=2)
         self.check = Toggle(self.inner, command=lambda v: win.toggle_mod(mod_id, v),
                             tooltip="Enable or disable this mod")
         self.check.pack(side="left", padx=(0, 10))
@@ -629,7 +727,14 @@ class ModRow(Row):
         status = st.status(self.mod_id)
         self.dot.configure(text=STATUS_DOT[status], fg=status_color(status))
         self.name.configure(text=mod.name, fg=C["fg"] if on else C["faint"])
+        by_order = self.win.sort.key() == "order"
+        if by_order and not self.grip.winfo_manager():
+            self.grip.pack(side="left", padx=(0, 6), before=self.check)
+        elif not by_order and self.grip.winfo_manager():
+            self.grip.pack_forget()
         parts = [f"v{clean_version(mod.version)}", mod.source_label, human_size(mod.size)]
+        if by_order and self.mod_id in st.order:
+            parts.insert(0, f"#{st.order.index(self.mod_id) + 1}")
         if mod.author:
             parts.append(f"by {mod.author}")
         self.sub.configure(text=" · ".join(parts))
@@ -650,8 +755,11 @@ class Window:
     def __init__(self, root):
         self.root = root
         root.title(APP_NAME)
-        root.geometry("1240x800")
-        root.minsize(900, 560)
+        # Wide enough for the whole top bar, but never bigger than the screen.
+        w = min(1340, root.winfo_screenwidth() - 40)
+        h = min(820, root.winfo_screenheight() - 80)
+        root.geometry(f"{w}x{h}")
+        root.minsize(min(900, w), min(560, h))
         self.icon = app_icon(root)
         try:
             root.iconphoto(True, self.icon)
@@ -660,22 +768,30 @@ class Window:
         self.state = State()
         self.rows = {}
         self.selected = None
+        self.profile_data = None     # {name: saved profile}, filled by refresh_profiles
+        self.active_profile = profiles.get_active()
+        self.detail_gen = 0      # bumped whenever anything a details page shows may have changed
+        self.visible_ids = []    # mod list rows in display order
         self.health_gen = 0
         self.running = game_mod.is_running()
         self.subscribing, self.downloading = set(), set()
         self._toast_job = None
         self.cpu = Worker("health-check")
         self.net = Worker("workshop")
+        self.pictures = WorkerPool("pictures", 6)   # Workshop previews, several at a time
         self.steam = Worker("steam")
         self.workshop_sig = self._workshop_signature()
 
         install_wheel(root)
         self._build()
+        self._size_window()
         self._bind_keys()
         self.populate()
         self.start_health_check()
         self.start_workshop_fetch()
         root.after(2000, self._poll)
+        # tidy the picture cache once things have settled (background thread)
+        root.after(5000, lambda: self.cpu.submit(workshop.prune_previews, lambda _r: None))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         Worker.pump(root)
 
@@ -685,28 +801,38 @@ class Window:
         root = self.root
         top = tk.Frame(root, bg=C["surface"], padx=16, pady=10)
         top.pack(fill="x")
-        titles = tk.Frame(top, bg=C["surface"])
+        # The right-hand controls are packed first so they always get their room; the title
+        # block on the left hides itself when the window is too narrow for everything.
+        right = tk.Frame(top, bg=C["surface"])
+        right.pack(side="right")
+        self.titles = titles = tk.Frame(top, bg=C["surface"])
         titles.pack(side="left")
         tk.Label(titles, text="Slay the Spire 2 Mods", font=F["app"], bg=C["surface"], fg=C["fg"]) \
             .pack(anchor="w")
         self.subtitle = tk.Label(titles, text="", font=F["small"], bg=C["surface"], fg=C["dim"])
         self.subtitle.pack(anchor="w")
 
-        tabs = tk.Frame(top, bg=C["surface2"], padx=3, pady=3)
+        self.tabs = tabs = tk.Frame(top, bg=C["surface2"], padx=3, pady=3)
         tabs.pack(side="left", padx=(28, 0))
+        top.bind("<Configure>", lambda e: self._fit_top_bar(e.width))
         self.tab_buttons = {}
         for key, text in (("installed", "My mods"), ("browse", "Get mods")):
             b = Pill(tabs, text, lambda k=key: self.show_page(k), "ghost", pady=5, padx=16, radius=7)
             b.pack(side="left")
             self.tab_buttons[key] = b
 
-        right = tk.Frame(top, bg=C["surface"])
-        right.pack(side="right")
         self.spinner = Spinner(right)
         self.spinner.pack(side="left", padx=(0, 12))
         Tooltip(self.spinner, "Checking mods…")
-        self.profile = Select(right, [("", "Profiles…")], "", on_change=self._on_profile_chosen, width=16)
+        Pill(right, "Copy mod list", self.copy_share_code,
+             tooltip="Copy a one-line code of your mod list to send to a friend").pack(side="left")
+        Pill(right, "Import mod list", self.compare_dialog,
+             tooltip="Paste a friend's mod list code to see what differs and match their setup").pack(side="left", padx=(6, 0))
+        tk.Frame(right, bg=C["border"], width=1, height=22).pack(side="left", padx=12)
+        tk.Label(right, text="Profile", fg=C["dim"], bg=C["surface"]).pack(side="left", padx=(0, 6))
+        self.profile = Select(right, [("", "No profile")], "", on_change=self._on_profile_chosen, width=15)
         self.profile.pack(side="left")
+        Tooltip(self.profile, "The profile your current setup comes from. Pick another to load it.")
         Pill(right, "Save as…", self.save_profile_dialog, tooltip="Save the current setup as a profile") \
             .pack(side="left", padx=(6, 0))
         self.menu_btn = Pill(right, "•••", self._open_menu, "ghost", padx=12, tooltip="More")
@@ -735,15 +861,46 @@ class Window:
         self.browse = BrowsePage(self, self.pages)
         self._build_installed()
 
-        self.toast_frame = tk.Frame(root, bg=C["toast_bg"], padx=16, pady=10)
-        self.toast_label = tk.Label(self.toast_frame, bg=C["toast_bg"], fg=C["toast_fg"], wraplength=620,
-                                    justify="left")
+        # A small card at the bottom of the window, in the theme's colors.
+        self.toast_frame = tk.Frame(root, bg=blend(C["fg"], C["surface2"], 0.24), padx=1, pady=1)
+        card = tk.Frame(self.toast_frame, bg=C["surface2"])
+        card.pack(fill="both", expand=True)
+        tk.Frame(card, bg=C["accent"], width=3).pack(side="left", fill="y")
+        self.toast_label = tk.Label(card, bg=C["surface2"], fg=C["fg"], wraplength=620, justify="left",
+                                    padx=14, pady=10)
         self.toast_label.pack(side="left")
-        close = tk.Label(self.toast_frame, text="✕", bg=C["toast_bg"], fg=C["toast_fg"], cursor="hand2",
-                         padx=6)
-        close.pack(side="left", padx=(12, 0))
+        close = tk.Label(card, text="✕", bg=C["surface2"], fg=C["dim"], padx=12)
+        close.pack(side="left", fill="y")
+        close.bind("<Enter>", lambda e: close.configure(fg=C["fg"]))
+        close.bind("<Leave>", lambda e: close.configure(fg=C["dim"]))
         close.bind("<Button-1>", lambda e: self.toast_frame.place_forget())
         self.show_page("installed")
+
+    def _top_bar_need(self):
+        """Width the top bar needs for the tabs and the controls on the right (not the title)."""
+        return 32 + self.tabs.winfo_reqwidth() + self.play_btn.master.winfo_reqwidth() + 28 + 16
+
+    def _size_window(self):
+        """Size the window from what the top bar really needs. Text grows with the display's
+        scaling on Windows and Linux (150%, 200%), so fixed pixel sizes would cut off the tabs."""
+        root = self.root
+        root.update_idletasks()
+        need = self._top_bar_need()
+        max_w, max_h = root.winfo_screenwidth() - 40, root.winfo_screenheight() - 80
+        w = min(max(px(1340), need + self.titles.winfo_reqwidth()), max_w)
+        h = min(px(820), max_h)
+        root.geometry(f"{w}x{h}")
+        root.minsize(min(max(px(900), need), max_w), min(px(560), h))
+
+    def _fit_top_bar(self, width):
+        need = self._top_bar_need()
+        show = width >= need + self.titles.winfo_reqwidth()
+        if show and not self.titles.winfo_manager():
+            self.titles.pack(side="left", before=self.tabs)
+            self.tabs.pack_configure(padx=(28, 0))
+        elif not show and self.titles.winfo_manager():
+            self.titles.pack_forget()
+            self.tabs.pack_configure(padx=(0, 0))
 
     def _build_installed(self):
         page = self.installed
@@ -751,12 +908,22 @@ class Window:
         bar.pack(fill="x")
         self.search = SearchEntry(bar, "Search mods by name, ID, author or tag", on_change=self.refilter)
         self.search.pack(side="left", fill="x", expand=True)
-        self.filter = Select(bar, FILTERS, "all", on_change=self.refilter)
+        # Start on the view used last time; All mods the first time.
+        start = load_ui_prefs().get("filter")
+        start = start if start in dict(FILTERS) else DEFAULT_FILTER
+        self.filter = Select(bar, FILTERS, start, on_change=self._on_filter_picked)
         self.filter.pack(side="left", padx=(8, 0))
         self.sort = Select(bar, SORTS, "name", on_change=self.refilter)
         self.sort.pack(side="left", padx=(8, 0))
         self.summary = tk.Label(bar, text="", fg=C["dim"], bg=C["surface"], font=F["small"])
         self.summary.pack(side="left", padx=(12, 0))
+        # Shown only when there's something to act on (see refresh_chrome).
+        self.broken_btn = Pill(bar, "", self.disable_broken, "danger",
+                               tooltip="Mark every enabled mod that looks broken to be disabled. "
+                                       "Nothing is written until you Apply.")
+        self.fix_btn = Pill(bar, "", self.fix_all, "secondary",
+                            tooltip="Apply the automatic fixes the health check found "
+                                    "(for example, misnamed files)")
         tk.Frame(page, bg=C["border"], height=1).pack(fill="x")
 
         paned = tk.PanedWindow(page, orient="horizontal", sashwidth=5, bg=C["border"], bd=0,
@@ -766,36 +933,112 @@ class Window:
         self.empty = tk.Label(self.list.body, text="No mods match.", fg=C["faint"], bg=C["surface"],
                               font=F["hint"])
         self.details = ScrollFrame(paned, padx=28, pady=22)
-        self.dt = Details(self.details)
-        paned.add(self.list, minsize=340, width=470, stretch="never")
-        paned.add(self.details, minsize=360, stretch="always")
+        self.dt = Details(self.details, cache_size=24)
+        paned.add(self.list, minsize=px(340), width=px(470), stretch="never")
+        paned.add(self.details, minsize=px(360), stretch="always")
 
     def _build_menu(self):
-        m = tk.Menu(self.root, tearoff=False)
-        m.add_command(label="Copy my mod list code", command=self.copy_share_code)
-        m.add_command(label="Compare with a friend's code…", command=self.compare_dialog)
-        m.add_separator()
-        m.add_command(label="Disable all broken mods", command=self.disable_broken)
-        m.add_command(label="Apply automatic fixes", command=self.fix_all)
-        m.add_command(label="Delete a profile…", command=self.delete_profile_dialog)
-        m.add_separator()
-        m.add_command(label="Restore settings backup…", command=self.restore_dialog)
-        m.add_command(label="Open game logs folder", command=lambda: self.state.game.logs_dir and
-                      game_mod.open_path(self.state.game.logs_dir))
-        m.add_command(label="Open local mods folder", command=self.open_mods_folder)
-        m.add_command(label="Refresh", accelerator="F5", command=self.reload)
-        m.add_command(label="About", command=self.about)
-        self.menu = m
+        self.menu = PopupMenu(self.menu_btn, [
+            ("Delete profiles…", self.delete_profile_dialog),
+            None,
+            ("Restore settings backup…", self.restore_dialog),
+            ("Open game logs folder", lambda: self.state.game.logs_dir and
+             game_mod.open_path(self.state.game.logs_dir)),
+            ("Open local mods folder", self.open_mods_folder),
+            ("Refresh", self.reload, "F5"),
+            ("About", self.about),
+        ])
 
     def _open_menu(self):
-        b = self.menu_btn
-        self.menu.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height() + 4)
+        self.menu.open()
 
     def _bind_keys(self):
         r = self.root
         for seq, fn in ((f"<{MOD}-f>", self.focus_search), (f"<{MOD}-r>", self.reload), ("<F5>", self.reload),
                         (f"<{MOD}-s>", self.apply)):
-            r.bind_all(seq, lambda e, fn=fn: (fn(), "break")[1])
+            r.bind_all(seq, lambda e, fn=fn: (None if Dialog.stack else fn(), "break")[1])
+        # List navigation. Same keys on every system.
+        nav = {"<Up>": lambda: self.step_selection(-1), "<Down>": lambda: self.step_selection(1),
+               "<Prior>": lambda: self.step_selection(-10), "<Next>": lambda: self.step_selection(10),
+               "<Home>": lambda: self.step_selection(-10 ** 6), "<End>": lambda: self.step_selection(10 ** 6),
+               "<space>": self.key_toggle, "<Return>": self.key_apply, "<KP_Enter>": self.key_apply,
+               "<Escape>": self.key_escape}
+        for seq, fn in nav.items():
+            r.bind_all(seq, lambda e, fn=fn, seq=seq: self._key(e, seq, fn), add="+")
+        # Option on macOS is Alt elsewhere: Alt+Up/Down moves the selected mod in the load order.
+        # "Option" is bound on macOS only: to Tk it means the Mod2 modifier, which on Linux is
+        # Num Lock, so there it would turn plain Up/Down into "move this mod" whenever Num Lock is on.
+        for mod_key in (("Alt", "Option") if osenv.IS_MAC else ("Alt",)):
+            for seq, d in ((f"<{mod_key}-Up>", -1), (f"<{mod_key}-Down>", 1)):
+                try:
+                    r.bind_all(seq, lambda e, d=d: self._key(e, "move", lambda: self.key_move(d)))
+                except tk.TclError:
+                    pass
+
+    def _key(self, e, seq, fn):
+        """Run a list shortcut unless the key belongs to whatever has focus (typing in a box,
+        an open dropdown, a dialog)."""
+        w = self.root.focus_get()
+        if w is None or w.winfo_toplevel() is not self.root or self.root.grab_current() not in (None, self.root):
+            return None
+        cls = w.winfo_class()
+        if isinstance(w, Select) or cls in ("Text", "Listbox"):
+            return None
+        if cls in ("TEntry", "Entry"):
+            # From a search box only Down (into the list) applies; the box handles Escape itself.
+            if seq != "<Down>":
+                return None
+        fn()
+        return "break"
+
+    def _nav_target(self):
+        """(ids in display order, current id, select function, list ScrollFrame, rows) for the
+        page that's showing."""
+        if self.page == "browse":
+            b = self.browse
+            return list(b.order), b.selected, b.select, b.list, b.rows
+        return list(self.visible_ids), self.selected, self.select, self.list, self.rows
+
+    def step_selection(self, delta):
+        ids, cur, select, scroll, rows = self._nav_target()
+        if not ids:
+            return
+        if cur in ids:
+            i = max(0, min(len(ids) - 1, ids.index(cur) + delta))
+        else:
+            i = 0 if delta > 0 else len(ids) - 1
+        if ids[i] != cur:
+            select(ids[i])
+        scroll.canvas.focus_set()          # keep the keys working on the list, not the search box
+        if ids[i] in rows:
+            scroll.see(rows[ids[i]])
+
+    def key_toggle(self):
+        if self.page == "installed" and self.selected in self.state.mods:
+            self.toggle_mod(self.selected, not self.state.enabled(self.selected))
+
+    def key_apply(self):
+        if self.page == "installed" and self.state.change_count() and not self.running:
+            self.apply()
+
+    def key_escape(self):
+        search = self.browse.search if self.page == "browse" else self.search
+        if search.value():
+            search.set("")
+            if self.page == "installed":
+                self.refilter()
+            return
+        if self.page == "installed" and self.selected:
+            if self.selected in self.rows:
+                self.rows[self.selected].set_selected(False)
+            self.selected = None
+            self.show_overview()
+
+    def key_move(self, delta):
+        if self.page == "installed" and self.selected in self.state.order:
+            self.move(self.selected, delta)
+            if self.selected in self.rows:
+                self.list.see(self.rows[self.selected])
 
     def focus_search(self):
         (self.browse.search if self.page == "browse" else self.search).focus_set()
@@ -840,22 +1083,27 @@ class Window:
             self.show_overview()
 
     def refresh_chrome(self):
+        self.detail_gen += 1
         st, g = self.state, self.state.game
         enabled = sum(1 for m in st.mods if st.enabled(m))
-        self.subtitle.configure(text=f"Game {g.version_text} · {g.branch} branch · {enabled} of "
-                                     f"{len(st.mods)} enabled")
+        self.subtitle.configure(text=f"Game {g.version_text} · {g.branch} · {enabled}/{len(st.mods)} enabled")
         counts = {}
         for mid in st.mods:
             if st.enabled(mid):
                 s = st.status(mid)
                 counts[s] = counts.get(s, 0) + 1
-        bits = []
-        if counts.get(S_ERROR):
-            bits.append(f"{counts[S_ERROR]} broken")
-        if counts.get(S_WARN):
-            bits.append(f"{counts[S_WARN]} with warnings")
-        self.summary.configure(text=("Enabled: " + ", ".join(bits)) if bits else "",
-                               fg=C["error"] if counts.get(S_ERROR) else C["dim"])
+        warns = counts.get(S_WARN, 0)
+        self.summary.configure(text=f"{warns} enabled with warnings" if warns else "", fg=C["dim"])
+        broken = counts.get(S_ERROR, 0)
+        fixable = sum(1 for m in st.mods.values() for i in m.static_issues if i.fix)
+        for btn, n, text in ((self.broken_btn, broken, f"Disable {plural(broken, 'broken mod')}"),
+                             (self.fix_btn, fixable, f"Apply {plural(fixable, 'fix', 'es')}")):
+            if n:
+                btn.set_text(text)
+                if not btn.winfo_manager():
+                    btn.pack(side="left", padx=(8, 0))
+            elif btn.winfo_manager():
+                btn.pack_forget()
 
         problems = list(g.problems) + ([st.settings_error] if st.settings_error else [])
         self._bar(self.bar_error, "\n".join(problems))
@@ -872,6 +1120,9 @@ class Window:
         if st.settings and not st.settings.mods_enabled:
             gtexts.append("Mods are switched off globally in the game's settings.")
         gtexts += [f"{i.title}. {i.detail}" for i in gissues if i is not fs]
+        self._certificate_notice = self.certificate_help()
+        if self._certificate_notice:
+            gtexts.append(self._certificate_notice)
         self._bar(self.bar_global, "\n".join(gtexts))
 
         n = st.change_count()
@@ -889,6 +1140,7 @@ class Window:
                 text=f"Unapplied changes: {', '.join(parts)}. They take effect next time the game starts.")
         self._bar(self.bar_pending, "x" if n else "")
         self.apply_btn.set_enabled(not self.running and st.settings is not None)
+        self.show_active_profile()
 
     def _bar(self, bar, text):
         if text:
@@ -947,10 +1199,22 @@ class Window:
 
         def done(info):
             self.state.workshop.update(info)
+            self.sync_certificate_notice()
             if self.selected:
                 self.show_details(self.selected, keep_scroll=True)
 
         self.net.submit(lambda: workshop.fetch_details(ids, force=force), done)
+
+    def certificate_help(self):
+        """What to tell the user about a certificate problem, or None if there isn't one."""
+        if osenv.certificates_missing():
+            return osenv.CERTIFICATES_HELP
+        return osenv.CERTIFICATE_FAILED_HELP if workshop.certificate_failed() else None
+
+    def sync_certificate_notice(self):
+        """Refresh the notice at the top if a certificate problem has appeared or cleared."""
+        if self.certificate_help() != self._certificate_notice:
+            self.refresh_chrome()
 
     def _poll(self):
         running = game_mod.is_running()
@@ -1000,7 +1264,9 @@ class Window:
         self.show_page("installed")
         if mod_id in self.rows:
             self.search.set("")
-            self.filter.set_key("all")
+            if not self._visible(mod_id):
+                self.filter.set_key("all", quiet=True)    # just for this jump; not remembered
+                self.refilter()
             self.select(mod_id)
             self.list.see(self.rows[mod_id])
 
@@ -1085,13 +1351,19 @@ class Window:
 
     # ---- filtering / sorting -------------------------------------------------------------
 
+    def _on_filter_picked(self):
+        save_ui_pref("filter", self.filter.key())     # remembered for next time
+        self.refilter()
+
     def _visible(self, mod_id):
         st, mod = self.state, self.state.mods.get(mod_id)
         if mod is None:
             return False
         f = self.filter.key()
         on = st.enabled(mod_id)
-        if f == "enabled" and not on or f == "disabled" and on:
+        # Current mods: the ones that are on, plus any with unapplied changes, so a mod you
+        # just switched off stays in view until you Apply.
+        if f == "current" and not (on or mod_id in st.pending) or f == "disabled" and on:
             return False
         if f == "problems" and st.status(mod_id) not in (S_ERROR, S_WARN):
             return False
@@ -1123,7 +1395,19 @@ class Window:
     def refilter(self):
         if not hasattr(self, "rows"):
             return
+        sort = self.sort.key()
+        if sort != getattr(self, "_last_sort", None):
+            self._last_sort = sort
+            for r in self.rows.values():
+                r.refresh()
+        elif sort == "order" and self.state.order != getattr(self, "_last_order", None):
+            for r in self.rows.values():      # positions shifted
+                r.refresh()
+        self._last_order = list(self.state.order)
         ids = sorted((m for m in self.rows if self._visible(m)), key=self._sort_key)
+        if ids == self.visible_ids and all(self.rows[m].winfo_manager() for m in ids):
+            return                   # nothing moved: skip re-packing every row
+        self.visible_ids = ids
         for r in self.rows.values():
             r.pack_forget()
         self.empty.pack_forget()
@@ -1134,7 +1418,9 @@ class Window:
 
     # ---- details pane --------------------------------------------------------------------
 
-    def select(self, mod_id):
+    def select(self, mod_id, focus_list=False):
+        if focus_list:
+            self.list.canvas.focus_set()
         if self.selected in self.rows:
             self.rows[self.selected].set_selected(False)
         self.selected = mod_id
@@ -1144,7 +1430,9 @@ class Window:
 
     def show_overview(self):
         dt, st = self.dt, self.state
-        dt.clear()
+        if dt.show_cached("overview", self.detail_gen):
+            return
+        dt.clear("overview", self.detail_gen)
         dt.title("Overview")
         if not st.report:
             dt.text("Checking your mods: reading game logs and each mod's code…", dim=True, pady=(8, 0))
@@ -1180,7 +1468,7 @@ class Window:
     def _link(self, parent, mod_id, suffix=""):
         mod = self.state.mods[mod_id]
         status = self.state.status(mod_id)
-        box = tk.Frame(parent, bg=parent.cget("bg"), cursor="hand2")
+        box = tk.Frame(parent, bg=parent.cget("bg"))
         dot = tk.Label(box, text=STATUS_DOT[status], fg=status_color(status), bg=box.cget("bg"), font=F["dot"])
         dot.pack(side="left")
         name = tk.Label(box, text=mod.name, fg=C["accent"], bg=box.cget("bg"))
@@ -1199,7 +1487,11 @@ class Window:
         if mod is None:
             return
         y = self.details.canvas.yview()[0] if keep_scroll else 0
-        dt.clear()
+        if keep_scroll:
+            self.detail_gen += 1        # a refresh: the data behind the page changed
+        elif dt.show_cached(mod_id, self.detail_gen):
+            return
+        dt.clear(mod_id, self.detail_gen)
         info = st.workshop_info(mod) or {}
 
         head = tk.Frame(dt.d, bg=C["surface"])
@@ -1263,8 +1555,11 @@ class Window:
             if steamugc.available(st.game):
                 Pill(btns, "Unsubscribe", lambda: self.unsubscribe(mod.workshop_id, mod.name), "danger") \
                     .pack(side="left", padx=(0, 8))
-        Pill(btns, "▼", lambda: self.move(mod_id, 1), padx=10, tooltip="Load later").pack(side="right")
-        Pill(btns, "▲", lambda: self.move(mod_id, -1), padx=10, tooltip="Load earlier") \
+        alt = "Option" if osenv.IS_MAC else "Alt"
+        Pill(btns, "▼", lambda: self.move(mod_id, 1), padx=10,
+             tooltip=f"Load later ({alt}+↓). Or sort by load order and drag it in the list.").pack(side="right")
+        Pill(btns, "▲", lambda: self.move(mod_id, -1), padx=10,
+             tooltip=f"Load earlier ({alt}+↑). Or sort by load order and drag it in the list.") \
             .pack(side="right", padx=(0, 4))
         tk.Label(btns, text="Load order", fg=C["dim"], bg=C["surface"]).pack(side="right", padx=(0, 8))
 
@@ -1362,14 +1657,36 @@ class Window:
                 .pack(side="left", padx=(10, 0))
 
     def _load_preview(self, wid, url, target, head):
+        self.show_preview(wid, url, target, head, anchor="n")
+
+    PREVIEW_PX = 168
+
+    def show_preview(self, wid, url, target, head, **pack):
+        """Put a Workshop item's preview in a details pane: the small list thumbnail at once
+        (scaled up, so a little soft) if it's cached, then the sharp version when it's ready."""
+        state = {"sharp": False}
+
+        def put(img, sharp):
+            if not img or not target.winfo_exists() or state["sharp"]:
+                return
+            state["sharp"] = sharp
+            target.image = img
+            target.configure(image=img)
+            if not target.winfo_manager():
+                target.pack(side="left", padx=(0, 20), before=head.winfo_children()[1], **pack)
+
+        thumb = workshop.thumb_cache_path(wid)
+        if os.path.exists(thumb):
+            small = load_image(thumb, 96, 96)
+            if small and small.width():
+                # integer zoom/subsample: about 1.75x, up to PREVIEW_PX
+                z = max(1, round(self.PREVIEW_PX / small.width() * 4))
+                put(small.zoom(z).subsample(4) if z > 4 else small, False)
         def done(path):
-            if path and target.winfo_exists():
-                img = load_image(path, 168, 168)
-                if img:
-                    target.image = img
-                    target.configure(image=img)
-                    target.pack(side="left", padx=(0, 20), anchor="n", before=head.winfo_children()[1])
-        self.net.submit(lambda: workshop.preview_path(wid, url), done)
+            if not path:
+                return
+            put(load_image(path, self.PREVIEW_PX, self.PREVIEW_PX), True)
+        self.pictures.submit(lambda: workshop.preview_path(wid, url), done)
 
     # ---- actions -------------------------------------------------------------------------
 
@@ -1417,6 +1734,106 @@ class Window:
                 self.sort.set_key("order", quiet=True)
                 self.toast("Sorted by load order. Note: the game always loads a mod's requirements before it.")
             self.refresh_rows([mod_id, order[i]])
+
+    # ---- drag to reorder ------------------------------------------------------------------
+
+    DRAG_START_PX = 8       # how far the pointer must move before a press becomes a drag
+    DRAG_EDGE_PX = 36       # pointer this close to the list's top/bottom edge scrolls it
+
+    def drag_event(self, mod_id, kind, e):
+        d = getattr(self, "_drag", None)
+        if kind == "press":
+            self._drag = {"id": mod_id, "y0": e.y_root, "active": False, "index": None}
+            return
+        if not d or d["id"] != mod_id:
+            return
+        if kind == "motion":
+            if not d["active"]:
+                if abs(e.y_root - d["y0"]) < self.DRAG_START_PX:
+                    return
+                if self.sort.key() != "order":
+                    self._drag = None
+                    self.toast("To drag mods into a new load order, choose Sort: Load order.")
+                    return
+                self._drag_begin(d)
+            self._drag_update(e.y_root)
+        elif kind == "release":
+            self._drag = None
+            if d["active"]:
+                self._drag_end(d)
+
+    def _drag_begin(self, d):
+        d["active"] = True
+        d["line"] = tk.Frame(self.list.body, height=3, bg=C["accent"])
+        row = self.rows.get(d["id"])
+        if row:
+            row.configure(cursor="sb_v_double_arrow")
+            row.name.configure(fg=C["faint"])
+        d["tick"] = self.root.after(30, self._drag_tick)
+
+    def _drag_index(self, y_root):
+        """Insertion point among the visible rows for a pointer at screen y."""
+        y = y_root - self.list.body.winfo_rooty()
+        for i, mid in enumerate(self.visible_ids):
+            r = self.rows[mid]
+            if y < r.winfo_y() + r.winfo_height() / 2:
+                return i, r.winfo_y()
+        last = self.rows[self.visible_ids[-1]] if self.visible_ids else None
+        return len(self.visible_ids), (last.winfo_y() + last.winfo_height()) if last else 0
+
+    def _drag_update(self, y_root):
+        d = self._drag
+        if not d or not self.visible_ids:
+            return
+        d["index"], y = self._drag_index(y_root)
+        d["line"].place(x=0, y=max(0, y - 1), relwidth=1)
+        d["line"].lift()
+
+    def _drag_tick(self):
+        """While dragging near the top or bottom edge, keep scrolling the list."""
+        d = getattr(self, "_drag", None)
+        if not d or not d["active"]:
+            return
+        y_root = self.root.winfo_pointery()
+        cy = y_root - self.list.canvas.winfo_rooty()
+        h = self.list.canvas.winfo_height()
+        if cy < self.DRAG_EDGE_PX:
+            self.list.scroll(-12)
+        elif cy > h - self.DRAG_EDGE_PX:
+            self.list.scroll(12)
+        self._drag_update(y_root)
+        d["tick"] = self.root.after(30, self._drag_tick)
+
+    def _drag_end(self, d):
+        if d.get("tick"):
+            self.root.after_cancel(d["tick"])
+        d["line"].destroy()
+        mod_id, i, ids = d["id"], d["index"], list(self.visible_ids)
+        row = self.rows.get(mod_id)
+        if row:
+            row.configure(cursor="")
+        if i is None or mod_id not in ids:
+            self.refresh_rows([mod_id])
+            return
+        here = ids.index(mod_id)
+        if i in (here, here + 1):              # dropped where it already was
+            self.refresh_rows([mod_id])
+            return
+        self.reorder(mod_id, ids[i] if i < len(ids) else None, after=ids[-1] if i >= len(ids) else None)
+
+    def reorder(self, mod_id, before=None, after=None):
+        """Move mod_id in the load order to just before `before` (or just after `after`)."""
+        order = self.state.order
+        order.remove(mod_id)
+        if before is not None:
+            order.insert(order.index(before), mod_id)
+        elif after is not None:
+            order.insert(order.index(after) + 1, mod_id)
+        else:
+            order.append(mod_id)
+        self.refresh_rows([mod_id])
+        if mod_id in self.rows:
+            self.list.see(self.rows[mod_id])
 
     def revert(self):
         self.state.pending.clear()
@@ -1531,11 +1948,45 @@ class Window:
     # ---- profiles ------------------------------------------------------------------------
 
     def refresh_profiles(self):
-        self.profile.set_choices([("", "Profiles…")] + [(n, n) for n in profiles.list_profiles()], "")
+        data = {}
+        for name in profiles.list_profiles():
+            try:
+                data[name] = profiles.load_profile(name)
+            except (OSError, ValueError):
+                continue
+        self.profile_data = data
+        if self.active_profile not in data:
+            self._set_active_profile(None)
+        self.show_active_profile()
+
+    def _set_active_profile(self, name):
+        if name != self.active_profile:
+            self.active_profile = name
+            profiles.set_active(name)
+
+    def show_active_profile(self):
+        """Put the active profile in the dropdown: its name when the current setup (including
+        unapplied changes) is exactly that profile, "Name (changed)" after edits, else "No profile"."""
+        if self.profile_data is None:
+            return
+        st, data = self.state, self.profile_data
+        names = list(data)
+        states = st.states()
+        candidates = ([self.active_profile] if self.active_profile in data else []) + names
+        match = next((n for n in candidates if profiles.matches(data[n], states, st.order, st.mods)), None)
+        if match:
+            self._set_active_profile(match)
+            self.profile.set_choices([(n, n) for n in names], match)
+        elif self.active_profile:
+            self.profile.set_choices([("", f"{self.active_profile} (changed)")] + [(n, n) for n in names], "")
+        else:
+            self.profile.set_choices([("", "No profile" if names else "No profiles yet")] +
+                                     [(n, n) for n in names], "")
 
     def _on_profile_chosen(self):
         name = self.profile.key()
         if not name:
+            self.show_active_profile()
             return
         try:
             data = profiles.load_profile(name)
@@ -1549,12 +2000,12 @@ class Window:
         order = [i for i in data.get("order", []) if i in st.mods]
         st.order = order + [i for i in st.order if i not in order]
         missing = [m for m in data.get("mods", []) if m.get("enabled") and m["id"] not in st.mods]
+        self._set_active_profile(name)
         self.refresh_rows()
         msg = f"Loaded profile “{name}”. Review, then Apply."
         if missing:
             msg += " Not installed: " + ", ".join(m.get("name", m["id"]) for m in missing)
         self.toast(msg)
-        self.root.after_idle(self.refresh_profiles)
 
     def save_profile_dialog(self):
         dlg = Dialog(self.root, "Save profile")
@@ -1568,6 +2019,17 @@ class Window:
         dlg.button("Cancel", 0)
         typed = {}
         var.trace_add("write", lambda *_: typed.update(text=var.get()))
+        if self.active_profile:
+            # Start from the active profile, so Save updates it. The name is selected:
+            # typing replaces it to save a new profile instead.
+            var.set(self.active_profile)
+            entry.select_range(0, "end")
+            entry.icursor("end")
+            tk.Label(dlg.body, text=f"Keep the name to update “{self.active_profile}”, or type a new one.",
+                     fg=C["dim"], bg=dlg.body.cget("bg"), font=F["small"], anchor="w") \
+                .pack(fill="x", pady=(6, 0))
+        # run() focuses the dialog window itself; put the cursor back in the name box, name selected
+        dlg.after(60, lambda: (entry.focus_force(), entry.select_range(0, "end"), entry.icursor("end")))
         if dlg.run() != 1:
             return
         text = typed.get("text", "").strip()
@@ -1575,6 +2037,7 @@ class Window:
             return
         st = self.state
         profiles.save_profile(text, st.states(), st.order, st.mods)
+        self._set_active_profile(text)
         self.refresh_profiles()
         self.toast(f"Saved profile “{text}”.")
 
@@ -1583,17 +2046,35 @@ class Window:
         if not names:
             self.toast("No saved profiles.")
             return
-        dlg = Dialog(self.root, "Delete profile")
-        dlg.heading("Delete a profile")
-        sel = Select(dlg.body, [(n, n) for n in names], names[0])
+        # Tick as many as you like, then one Delete removes them all and closes the dialog.
+        dlg = Dialog(self.root, "Delete profiles")
+        all_key = "⌘A" if osenv.IS_MAC else "Ctrl+A"
+        dlg.heading("Delete profiles", f"Tick the profiles to delete. Shift-click ticks a range; {all_key} "
+                                       "ticks them all.")
+        picked = []
+
+        def changed():
+            picked[:] = sel.keys()
+            btn.set_text(f"Delete {plural(len(picked), 'profile')}" if picked else "Delete")
+            btn.set_enabled(bool(picked))
+
+        sel = CheckList(dlg.body, [(n, f"{n}   (active)" if n == self.active_profile else n) for n in names],
+                        on_change=changed)
         sel.pack(fill="x", pady=(14, 0))
-        dlg.button("Delete", 1, "danger")
+        dlg.after(60, sel.focus_set)
+        btn = dlg.button("Delete", 1, "danger")
+        btn.set_enabled(False)
         dlg.button("Cancel", 0)
-        chosen = {}
-        sel.bind("<<ComboboxSelected>>", lambda e: chosen.update(k=sel.key()), add="+")
-        if dlg.run() == 1:
-            profiles.delete_profile(chosen.get("k", names[0]))
-            self.refresh_profiles()
+        dlg.bind("<Return>", lambda e: dlg.close(1) if picked else None)
+        if dlg.run() != 1 or not picked:
+            return
+        for name in picked:
+            profiles.delete_profile(name)
+        if self.active_profile in picked:
+            self._set_active_profile(None)
+        self.refresh_profiles()
+        self.toast(f"Deleted profile “{picked[0]}”." if len(picked) == 1 else
+                   f"Deleted {len(picked)} profiles.")
 
     # ---- co-op ---------------------------------------------------------------------------
 
@@ -1605,30 +2086,51 @@ class Window:
         n = sum(1 for m in st.mods if st.enabled(m))
         note = " (includes unapplied changes)" if st.change_count() else ""
         self.toast(f"Copied a code for your {plural(n, 'enabled mod')}{note}. Paste it to your friend; they "
-                   "use Compare with a friend's code.")
+                   "press Import mod list and paste it.")
 
     def compare_dialog(self):
+        """Import mod list: a friend's code already on the clipboard is compared right away.
+        Anything else is ignored and the paste box opens, ready to type into."""
         try:
             clip = self.root.clipboard_get()
         except tk.TclError:
             clip = ""
+        note = ""
         found = profiles.find_share_code(clip)
         if found and found == profiles.share_code(self.state.states(), self.state.mods, self.state.game):
-            found = None            # that's our own code, not the friend's
-        dlg = Dialog(self.root, "Compare with a friend", width=520)
+            note = "The clipboard has your own mod list, so it wasn't used."
+        elif found:
+            try:
+                theirs = profiles.parse_share_code(found)
+            except ValueError as e:
+                note = f"The clipboard has a mod list code, but it couldn't be read: {e}"
+            else:
+                self._compare_with(theirs)
+                return
+        dlg = Dialog(self.root, "Import mod list", width=520)
         dlg.heading("Paste your friend's code",
-                    "They get it from ••• → Copy my mod list code. Pasting their whole message works too.")
+                    "They get it from the Copy mod list button. Pasting their whole message works too.")
+        if note:
+            WrapLabel(dlg.body, note, fg=C["warn"], font=F["small"]).pack(fill="x", pady=(8, 0))
         box = tk.Frame(dlg.body, bg=C["border"], padx=1, pady=1)
         box.pack(fill="both", expand=True, pady=(14, 0))
-        text = tk.Text(box, height=5, wrap="char", font=F["mono"], bg=C["input"], fg=C["fg"], relief="flat",
+        text = tk.Text(box, height=5, width=1, wrap="char", font=F["mono"], bg=C["input"], fg=C["fg"], relief="flat",
                        bd=0, highlightthickness=0, insertbackground=C["fg"], padx=8, pady=6)
         text.pack(fill="both", expand=True)
-        if found:
-            text.insert("1.0", found)
-        text.focus_set()
-        pasted = {"text": found or ""}
-        text.bind("<KeyRelease>", lambda e: pasted.update(text=text.get("1.0", "end")))
-        text.bind("<<Paste>>", lambda e: self.root.after_idle(lambda: pasted.update(text=text.get("1.0", "end"))))
+        # Read the box at the moment the dialog closes (it's gone afterwards), so it doesn't matter
+        # how the text got there: typing, Ctrl+V, a menu, or a middle-click paste on Linux.
+        pasted = {"text": ""}
+        close = dlg.close
+
+        def closing(value=None):
+            try:
+                pasted["text"] = text.get("1.0", "end")
+            except tk.TclError:
+                pass
+            close(value)
+        dlg.close = closing
+        # run() focuses the dialog window itself; put the cursor in the paste box after that
+        dlg.after(60, text.focus_force)
         dlg.button("Compare", 1, "primary", default=True)
         dlg.button("Cancel", 0)
         if dlg.run() != 1:
@@ -1638,6 +2140,9 @@ class Window:
         except ValueError as e:
             self.error("Couldn't read that code", str(e))
             return
+        self._compare_with(theirs)
+
+    def _compare_with(self, theirs):
         # Workshop mods come without names; look them up before showing the comparison.
         wids = [m["workshop_id"] for m in theirs["mods"] if m.get("workshop_id")]
 
@@ -1655,8 +2160,7 @@ class Window:
         st = self.state
         diff = profiles.compare(theirs, st.states(), st.mods, st.game)
 
-        dlg = Dialog(self.root, "Compare mod lists", width=640)
-        dlg.geometry("660x600")
+        dlg = Dialog(self.root, "Compare mod lists", width=520)
         scroll = ScrollFrame(dlg.body)
         scroll.pack(fill="both", expand=True)
         dt = Details(scroll)
@@ -1706,6 +2210,7 @@ class Window:
         if diff["optional_only"]:
             dt.text(f"{plural(len(diff['optional_only']), 'client-side mod')} differ too, which doesn't "
                     "matter for co-op.", dim=True, pady=(14, 0))
+        dlg.fit_scroll(scroll)              # as tall as the content needs, scrolling past 60% of the screen
         match = dlg.button("Match their setup", 1, "primary")
         match.set_enabled(bool(diff["disabled"] or diff["extra"]))
         Tooltip(match, "Enable the mods they use that you have, and disable gameplay mods they don't have. "
@@ -1731,9 +2236,10 @@ class Window:
         dlg.heading("Restore settings backup",
                     "Restores the game's settings.save (including which mods are enabled) to how it was "
                     "before an earlier Apply. Your current file is backed up first.")
-        sel = Select(dlg.body, [(b, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(b))))
-                                for b in backups], backups[0])
+        sel = ChoiceList(dlg.body, [(b, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(b))))
+                                    for b in backups], backups[0])
         sel.pack(fill="x", pady=(14, 0))
+        dlg.after(60, sel.focus_set)
         chosen = {"k": backups[0]}
         sel.bind("<<ComboboxSelected>>", lambda e: chosen.update(k=sel.key()), add="+")
         dlg.button("Restore", 1, "primary")
@@ -1753,7 +2259,8 @@ class Window:
 
     def toast(self, text):
         self.toast_label.configure(text=text)
-        self.toast_frame.place(relx=0.5, y=74, anchor="n")
+        self.toast_label.configure(wraplength=max(200, min(px(620), self.root.winfo_width() - 120)))
+        self.toast_frame.place(relx=0.5, rely=1.0, y=-24, anchor="s")
         self.toast_frame.lift()
         if self._toast_job:
             self.root.after_cancel(self._toast_job)
@@ -1796,6 +2303,9 @@ class Window:
         dlg.run()
 
     def _on_close(self):
+        if Dialog.stack:
+            Dialog.stack[-1].close()
+            return
         if self.state.change_count():
             resp = self.ask("Apply changes before closing?",
                             "You have changes that haven't been written to the game's settings.",
@@ -1824,6 +2334,10 @@ def run():
     win = Window(root)
     win.refresh_profiles()
     root.mainloop()
-    sys.stdout.flush()
-    sys.stderr.flush()
+    for stream in (sys.stdout, sys.stderr):     # both are None in windowed builds (the .exe, pythonw)
+        try:
+            if stream is not None:
+                stream.flush()
+        except (OSError, ValueError):
+            pass
     os._exit(0)   # background threads may be blocked on network I/O
