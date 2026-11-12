@@ -116,6 +116,8 @@ def delete_profile(name):
 #     ID difference from the previous one * 2 + gameplay flag   (varint)
 #     version fingerprint (2 bytes: CRC-32 of the version text, low 16 bits)
 #   number of local mods, then for each: id, version, gameplay flag
+#   optional: number of named Workshop entries, then for each: index in the Workshop list, mod id
+#     (only for Workshop items holding more than one mod; older readers ignore trailing bytes)
 # Workshop mods carry no id or name: the receiver matches the Workshop ID against its own mods
 # and looks up titles on the Workshop. That keeps a mod to about 6 bytes (8 characters).
 
@@ -171,7 +173,7 @@ class _Reader:
 def share_code(states, mods, game):
     enabled = [m for m in mods.values() if states.get(m.id, True)]
     workshop = sorted((m for m in enabled if m.workshop_id and m.workshop_id.isdigit()),
-                      key=lambda m: int(m.workshop_id))
+                      key=lambda m: (int(m.workshop_id), m.id))
     local = [m for m in enabled if m not in workshop]
     out = bytearray([SHARE_FORMAT]) + _string(game.version_text) + _string(game.branch)
     out += _varint(len(workshop))
@@ -184,6 +186,15 @@ def share_code(states, mods, game):
     out += _varint(len(local))
     for m in local:
         out += _string(m.id) + _string(m.version) + bytes([int(m.affects_gameplay)])
+    # One Workshop item can hold several mods; the Workshop ID alone can't tell them apart.
+    counts = {}
+    for m in mods.values():
+        counts[m.workshop_id] = counts.get(m.workshop_id, 0) + 1
+    named = [(i, m.id) for i, m in enumerate(workshop) if counts[m.workshop_id] > 1]
+    if named:
+        out += _varint(len(named))
+        for i, mod_id in named:
+            out += _varint(i) + _string(mod_id)
     return SHARE_PREFIX + base64.urlsafe_b64encode(bytes(out)).decode().rstrip("=")
 
 
@@ -216,6 +227,12 @@ def parse_share_code(text):
             mod_id, version = r.string(), r.string()
             data["mods"].append({"id": mod_id, "name": mod_id, "version": version, "workshop_id": None,
                                  "affects_gameplay": bool(r.byte())})
+        if r.pos < len(r.data):
+            workshop_entries = [m for m in data["mods"] if m["workshop_id"]]
+            for _ in range(r.varint()):
+                i, mod_id = r.varint(), r.string()
+                if i < len(workshop_entries):
+                    workshop_entries[i]["id"] = workshop_entries[i]["name"] = mod_id
     except ValueError as e:
         if "newer version" in str(e):
             raise
@@ -229,37 +246,60 @@ def parse_share_code(text):
 
 def compare(theirs, states, mods, game):
     """Differences that matter for joining each other's co-op games."""
-    by_wid = {m.workshop_id: mid for mid, m in mods.items() if m.workshop_id}
+    by_wid = {}
+    for mid in sorted(mods):
+        if mods[mid].workshop_id:
+            by_wid.setdefault(mods[mid].workshop_id, []).append(mid)
+    entries = [t for t in theirs["mods"] if isinstance(t, dict)]
+    named = {t["id"] for t in entries if t.get("id")}
     their_mods = {}
-    for t in theirs["mods"]:
-        if not isinstance(t, dict):
-            continue
-        # Share codes identify Workshop mods by Workshop ID only; match them to installed mods.
-        mid = t.get("id") or by_wid.get(t.get("workshop_id")) or f"workshop:{t.get('workshop_id')}"
+    for t in entries:
+        mid = t.get("id")
+        if not mid:
+            # Share codes identify Workshop mods by Workshop ID only; match them to installed mods.
+            # An item can hold several mods: prefer one with the same version, then any unused one.
+            wid = t.get("workshop_id")
+            free = [c for c in by_wid.get(wid, []) if c not in their_mods and c not in named]
+            same = [c for c in free if version_fingerprint(mods[c].version) == t.get("version_fingerprint")]
+            mid = (same or free or [f"workshop:{wid}"])[0]
         their_mods[mid] = dict(t, id=mid) if mid in mods else t
     mine = {mid: m for mid, m in mods.items() if states.get(mid, True)}
+    # Every list holds client-side mods too (a "client-side" library can still be needed by the
+    # mods that use it); only gameplay mods block co-op, see diff_is_clean.
     diff = {"branch": None, "game_version": None, "missing": [], "disabled": [], "extra": [],
-            "version": [], "optional_only": []}
+            "version": [], "rows": []}
     if theirs.get("branch") and theirs["branch"] != game.branch:
         diff["branch"] = (game.branch, theirs["branch"])
     if theirs.get("game_version") and theirs["game_version"] != game.version_text:
         diff["game_version"] = (game.version_text, theirs["game_version"])
     for mid, t in their_mods.items():
-        gameplay = t.get("affects_gameplay", True) is not False
         if mid not in mods:
-            (diff["missing"] if gameplay else diff["optional_only"]).append(t)
+            status = "missing"
+            diff["missing"].append(t)
         elif mid not in mine:
-            (diff["disabled"] if gameplay else diff["optional_only"]).append(t)
-        elif "version_fingerprint" in t:
-            if version_fingerprint(mods[mid].version) != t["version_fingerprint"]:
-                diff["version"].append((mods[mid], t))
-        elif t.get("version") and mods[mid].version != t["version"]:
+            status = "disabled"
+            diff["disabled"].append(t)
+        elif ("version_fingerprint" in t and version_fingerprint(mods[mid].version) != t["version_fingerprint"]) \
+                or ("version_fingerprint" not in t and t.get("version") and mods[mid].version != t["version"]):
+            status = "version"
             diff["version"].append((mods[mid], t))
+        else:
+            status = "ok"
+        name = mods[mid].name if mid in mods else (t.get("name") or t.get("id") or mid)
+        diff["rows"].append({"status": status, "name": name, "theirs": t, "mine": mods.get(mid),
+                             "gameplay": _gameplay(t)})
     for mid, m in mine.items():
         if mid not in their_mods and m.affects_gameplay:
             diff["extra"].append(m)
+    diff["rows"].sort(key=lambda r: r["name"].lower())
     return diff
 
 
+def _gameplay(t):
+    return t.get("affects_gameplay", True) is not False
+
+
 def diff_is_clean(diff):
-    return not any(diff[k] for k in ("branch", "game_version", "missing", "disabled", "extra", "version"))
+    return not (diff["branch"] or diff["game_version"] or diff["extra"]
+                or any(_gameplay(t) for t in diff["missing"] + diff["disabled"])
+                or any(_gameplay(t) for _m, t in diff["version"]))

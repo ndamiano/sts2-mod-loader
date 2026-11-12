@@ -275,11 +275,19 @@ class TestProfiles(Sandbox):
             {"id": "Other", "workshop_id": "9"}, {"id": "Emotes", "affects_gameplay": False}]}
         diff = profiles.compare(theirs, {"Lib": True, "Char": True, "Mine": True}, mods, self.game)
         self.assertEqual(diff["branch"], ("public-beta", "public"))
-        self.assertEqual([t["id"] for t in diff["missing"]], ["Other"])
+        self.assertEqual([t["id"] for t in diff["missing"]], ["Other", "Emotes"])   # client-side too
         self.assertEqual([m.id for m in diff["extra"]], ["Mine"])
         self.assertEqual([p[0].id for p in diff["version"]], ["Char"])
-        self.assertEqual(len(diff["optional_only"]), 1)
+        self.assertEqual([(r["name"], r["status"]) for r in diff["rows"]],
+                         [("Char", "version"), ("Emotes", "missing"), ("Lib", "ok"), ("Other", "missing")])
         self.assertFalse(profiles.diff_is_clean(diff))
+        # a missing client-side mod is listed, but doesn't block co-op
+        only_client = {"mods": [{"id": "Lib", "version": "1.0.0"}, {"id": "Char", "version": "1.0.0"},
+                                {"id": "Mine", "version": "1.0.0"},
+                                {"id": "Emotes", "workshop_id": "8", "affects_gameplay": False}]}
+        diff = profiles.compare(only_client, {"Lib": True, "Char": True, "Mine": True}, mods, self.game)
+        self.assertEqual([t["id"] for t in diff["missing"]], ["Emotes"])
+        self.assertTrue(profiles.diff_is_clean(diff))
 
         code = profiles.share_code({"Lib": True, "Char": False, "Mine": True}, mods, self.game)
         self.assertEqual({m["workshop_id"] for m in profiles.parse_share_code(code)["mods"]}, {"1", "3"})
@@ -348,6 +356,26 @@ class TestShareCode(Sandbox):
         theirs = profiles.parse_share_code(code)
         diff = profiles.compare(theirs, {}, {}, self.game)
         self.assertEqual(sorted(t["workshop_id"] for t in diff["missing"]), ["3747500076", "3747501308"])
+
+    def test_workshop_item_with_several_mods(self):
+        mods = {mid: mods_mod.Mod(mid, mid, version=v, workshop_id="3747561525")
+                for mid, v in (("MultiEnchantmentMod", "1.0"), ("EnchantLib", "1.0"))}
+        for states in ({"MultiEnchantmentMod": True, "EnchantLib": True},
+                       {"MultiEnchantmentMod": True, "EnchantLib": False},
+                       {"MultiEnchantmentMod": False, "EnchantLib": True}):
+            theirs = profiles.parse_share_code(profiles.share_code(states, mods, self.game))
+            self.assertTrue(profiles.diff_is_clean(profiles.compare(theirs, states, mods, self.game)), states)
+        theirs = profiles.parse_share_code(
+            profiles.share_code({"MultiEnchantmentMod": True, "EnchantLib": True}, mods, self.game))
+        diff = profiles.compare(theirs, {"MultiEnchantmentMod": True, "EnchantLib": False}, mods, self.game)
+        self.assertEqual([t["id"] for t in diff["disabled"]], ["EnchantLib"])
+        self.assertFalse(diff["extra"])
+        # a code without the mod names (older version) still pairs the mods up by version
+        mods["EnchantLib"].version = "2.0"
+        for t in theirs["mods"]:
+            t["id"], t["version_fingerprint"] = None, profiles.version_fingerprint(mods[t["name"]].version)
+        self.assertTrue(profiles.diff_is_clean(profiles.compare(
+            theirs, {"MultiEnchantmentMod": True, "EnchantLib": True}, mods, self.game)))
 
     def test_rejects_garbage(self):
         with self.assertRaises(ValueError):

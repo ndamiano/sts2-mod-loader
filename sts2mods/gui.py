@@ -824,8 +824,8 @@ class Window:
         self.spinner = Spinner(right)
         self.spinner.pack(side="left", padx=(0, 12))
         Tooltip(self.spinner, "Checking mods…")
-        Pill(right, "Copy mod list", self.copy_share_code,
-             tooltip="Copy a one-line code of your mod list to send to a friend").pack(side="left")
+        Pill(right, "Export mod list", self.copy_share_code,
+             tooltip="Show a one-line code of your mod list to send to a friend").pack(side="left")
         Pill(right, "Import mod list", self.compare_dialog,
              tooltip="Paste a friend's mod list code to see what differs and match their setup").pack(side="left", padx=(6, 0))
         tk.Frame(right, bg=C["border"], width=1, height=22).pack(side="left", padx=12)
@@ -2078,45 +2078,45 @@ class Window:
 
     # ---- co-op ---------------------------------------------------------------------------
 
-    def copy_share_code(self):
-        st = self.state
-        code = profiles.share_code(st.states(), st.mods, st.game)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(code)
-        n = sum(1 for m in st.mods if st.enabled(m))
-        note = " (includes unapplied changes)" if st.change_count() else ""
-        self.toast(f"Copied a code for your {plural(n, 'enabled mod')}{note}. Paste it to your friend; they "
-                   "press Import mod list and paste it.")
-
-    def compare_dialog(self):
-        """Import mod list: a friend's code already on the clipboard is compared right away.
-        Anything else is ignored and the paste box opens, ready to type into."""
-        try:
-            clip = self.root.clipboard_get()
-        except tk.TclError:
-            clip = ""
-        note = ""
-        found = profiles.find_share_code(clip)
-        if found and found == profiles.share_code(self.state.states(), self.state.mods, self.state.game):
-            note = "The clipboard has your own mod list, so it wasn't used."
-        elif found:
-            try:
-                theirs = profiles.parse_share_code(found)
-            except ValueError as e:
-                note = f"The clipboard has a mod list code, but it couldn't be read: {e}"
-            else:
-                self._compare_with(theirs)
-                return
-        dlg = Dialog(self.root, "Import mod list", width=520)
-        dlg.heading("Paste your friend's code",
-                    "They get it from the Copy mod list button. Pasting their whole message works too.")
-        if note:
-            WrapLabel(dlg.body, note, fg=C["warn"], font=F["small"]).pack(fill="x", pady=(8, 0))
+    def _code_box(self, dlg, height):
         box = tk.Frame(dlg.body, bg=C["border"], padx=1, pady=1)
         box.pack(fill="both", expand=True, pady=(14, 0))
-        text = tk.Text(box, height=5, width=1, wrap="char", font=F["mono"], bg=C["input"], fg=C["fg"], relief="flat",
-                       bd=0, highlightthickness=0, insertbackground=C["fg"], padx=8, pady=6)
+        text = tk.Text(box, height=height, width=1, wrap="char", font=F["mono"], bg=C["input"], fg=C["fg"],
+                       relief="flat", bd=0, highlightthickness=0, insertbackground=C["fg"], padx=8, pady=6)
         text.pack(fill="both", expand=True)
+        return text
+
+    def copy_share_code(self):
+        """Export mod list: show the code, selected, for the user to copy themselves."""
+        st = self.state
+        code = profiles.share_code(st.states(), st.mods, st.game)
+        n = sum(1 for m in st.mods if st.enabled(m))
+        note = " It includes changes you haven't applied yet." if st.change_count() else ""
+        dlg = Dialog(self.root, "Export mod list", width=520)
+        dlg.heading("Your mod list code",
+                    f"A code for your {plural(n, 'enabled mod')}.{note} Copy it (Ctrl+C) and send it to your "
+                    "friend; they press Import mod list and paste it.")
+        text = self._code_box(dlg, 4)
+        text.insert("1.0", code)
+        # keep it selectable and copyable, but not editable
+        passthrough = ("Left", "Right", "Up", "Down", "Home", "End", "Return", "KP_Enter", "Escape", "Tab")
+        text.bind("<Key>", lambda e: None if (e.state & 0xC or e.keysym in passthrough) else "break")
+        for event in ("<<Cut>>", "<<Paste>>", "<<PasteSelection>>", "<<Clear>>"):
+            text.bind(event, lambda e: "break")
+
+        def select_all():
+            text.focus_force()
+            text.tag_add("sel", "1.0", "end-1c")
+        dlg.after(60, select_all)
+        dlg.button("Done", 0, "primary", default=True)
+        dlg.run()
+
+    def compare_dialog(self):
+        """Import mod list: paste a friend's code and compare it with this setup."""
+        dlg = Dialog(self.root, "Import mod list", width=520)
+        dlg.heading("Paste your friend's code",
+                    "They get it from the Export mod list button. Pasting their whole message works too.")
+        text = self._code_box(dlg, 5)
         # Read the box at the moment the dialog closes (it's gone afterwards), so it doesn't matter
         # how the text got there: typing, Ctrl+V, a menu, or a middle-click paste on Linux.
         pasted = {"text": ""}
@@ -2151,7 +2151,8 @@ class Window:
             for m in theirs["mods"]:
                 title = (self.state.workshop.get(m.get("workshop_id") or "") or {}).get("title")
                 if title:
-                    m["name"] = title
+                    # mods named in the code share their Workshop item with other mods
+                    m["name"] = f"{title} ({m['id']})" if m.get("id") else title
             self.show_comparison(theirs)
         self.toast("Comparing…")
         self.net.submit(lambda: workshop.fetch_details(wids), done)
@@ -2175,41 +2176,47 @@ class Window:
             dt.text(f"Different game version: {diff['game_version'][0]} vs {diff['game_version'][1]}. "
                     "One of you needs to update.", pady=(8, 0))
 
-        def section(title, items, make):
-            if items:
-                dt.section(title)
-                for it in items:
-                    make(it)
+        missing = [t for t in diff["missing"] if t.get("workshop_id")]
+        names = {t["workshop_id"]: t.get("name") for t in missing}
+        if len(missing) > 1:
+            b = dt.buttons(pady=(8, 0))
+            Pill(b, f"Subscribe to all {len(missing)} missing", lambda: self.subscribe(list(names), names),
+                 "primary", pady=4).pack(side="left")
 
-        missing_ids = [t["workshop_id"] for t in diff["missing"] if t.get("workshop_id")]
+        labels = {"ok": ("Same", C["ok"]), "missing": ("Not installed", C["error"]),
+                  "disabled": ("Disabled for you", C["warn"]), "version": ("Different version", C["warn"])}
 
-        def missing_row(t):
+        def mod_row(name, status, color, version=None, gameplay=True, wid=None):
             row = tk.Frame(dt.d, bg=C["surface"])
             row.pack(fill="x", pady=2)
-            tk.Label(row, text=t.get("name") or t.get("id"), bg=C["surface"]).pack(side="left")
-            if t.get("version"):
-                tk.Label(row, text=f"v{clean_version(t['version'])}", fg=C["dim"], bg=C["surface"]) \
+            tk.Label(row, text=name, bg=C["surface"], fg=C["fg"]).pack(side="left")
+            if version:
+                tk.Label(row, text=f"v{clean_version(version)}", fg=C["dim"], bg=C["surface"]) \
                     .pack(side="left", padx=(6, 0))
-            if t.get("workshop_id"):
-                Pill(row, "Subscribe", lambda: self.subscribe([t["workshop_id"]], {t["workshop_id"]: t.get("name")}),
-                     pady=3, padx=10).pack(side="right")
+            if not gameplay:
+                tk.Label(row, text="client-side", fg=C["faint"], bg=C["surface"]).pack(side="left", padx=(6, 0))
+            if wid:
+                Pill(row, "Subscribe", lambda: self.subscribe([wid], {wid: name}),
+                     pady=3, padx=10).pack(side="right", padx=(8, 0))
+            tk.Label(row, text=status, fg=color, bg=C["surface"]).pack(side="right")
 
-        section("They have, you don't have installed", diff["missing"], missing_row)
-        if len(missing_ids) > 1:
-            b = dt.buttons(pady=(8, 0))
-            names = {t["workshop_id"]: t.get("name") for t in diff["missing"] if t.get("workshop_id")}
-            Pill(b, f"Subscribe to all {len(missing_ids)}", lambda: self.subscribe(missing_ids, names),
-                 "primary", pady=4).pack(side="left")
-        section("They have it enabled, you have it disabled", diff["disabled"],
-                lambda t: dt.text(t.get("name") or t.get("id")))
-        section("You have enabled, they don't", diff["extra"], lambda m: dt.text(m.name))
-        section("Different versions (one of you needs the Workshop update)", diff["version"],
-                lambda pair: dt.text(f"{pair[0].name}: you have v{clean_version(pair[0].version)}, theirs is "
-                                     + (f"v{clean_version(pair[1]['version'])}" if pair[1].get("version")
-                                        else "a different version")))
-        if diff["optional_only"]:
-            dt.text(f"{plural(len(diff['optional_only']), 'client-side mod')} differ too, which doesn't "
-                    "matter for co-op.", dim=True, pady=(14, 0))
+        dt.section(f"Their mods ({len(diff['rows'])})")
+        if not diff["rows"]:
+            dt.text("They have no mods enabled.", dim=True)
+        for r in diff["rows"]:
+            t, mine = r["theirs"], r["mine"]
+            status, color = labels[r["status"]]
+            version = mine.version if mine else t.get("version")
+            if r["status"] == "version":
+                status = f"You have v{clean_version(mine.version)}" + \
+                    (f", they have v{clean_version(t['version'])}" if t.get("version") else ", theirs differs")
+                version = None
+            mod_row(r["name"], status, color, version, r["gameplay"],
+                    t.get("workshop_id") if r["status"] == "missing" else None)
+        if diff["extra"]:
+            dt.section(f"You have enabled, they don't ({len(diff['extra'])})")
+            for m in diff["extra"]:
+                mod_row(m.name, "Only you", C["error"], m.version)
         dlg.fit_scroll(scroll)              # as tall as the content needs, scrolling past 60% of the screen
         match = dlg.button("Match their setup", 1, "primary")
         match.set_enabled(bool(diff["disabled"] or diff["extra"]))
