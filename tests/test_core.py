@@ -384,6 +384,95 @@ class TestShareCode(Sandbox):
             profiles.parse_share_code(profiles.SHARE_PREFIX + "abc")
 
 
+class TestWorkshopState(Sandbox):
+    """Which Workshop items have an update waiting, from Steam's record of them."""
+
+    def state(self, installed, details, branch="public-beta"):
+        def block(d, depth=2):
+            pad = "\t" * depth
+            return "".join(f'{pad}"{k}"\n{pad}{{\n{block(v, depth + 1)}{pad}}}\n' if isinstance(v, dict)
+                           else f'{pad}"{k}"\t\t"{v}"\n' for k, v in d.items())
+        path = os.path.join(self.tmp, "appworkshop.acf")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('"AppWorkshop"\n{\n' + block({"WorkshopItemsInstalled": {"7": installed},
+                                                  "WorkshopItemDetails": {"7": details}}, 1) + "}\n")
+        return mods_mod.workshop_state(path, branch)["7"]
+
+    def snap(self, t, manifest, lo, hi):
+        return {"timeupdated": t, "manifest": manifest, "game_branch_min": lo, "game_branch_max": hi}
+
+    def test_newer_manifest_is_an_update(self):
+        self.assertEqual(self.state({"timeupdated": 10, "manifest": "a"},
+                                    {"latest_timeupdated": 20, "latest_manifest": "b"}),
+                         (10, 20, True, False))
+
+    def test_same_files_touched_later_is_not(self):
+        self.assertFalse(self.state({"timeupdated": 10, "manifest": "a"},
+                                    {"latest_timeupdated": 20, "latest_manifest": "a"})[2])
+
+    def test_newest_version_for_another_branch_is_not(self):
+        got = self.state({"timeupdated": 10, "manifest": "a"},
+                         {"latest_timeupdated": 20, "latest_manifest": "b", "author_snapshots": {
+                             "0": self.snap(10, "a", "public-beta", "public-beta"),
+                             "1": self.snap(20, "b", "public", "public")}})
+        self.assertEqual(got[2:], (False, True))
+
+    def test_newer_version_for_this_branch_is(self):
+        got = self.state({"timeupdated": 10, "manifest": "a"},
+                         {"latest_timeupdated": 30, "latest_manifest": "c", "author_snapshots": {
+                             "0": self.snap(10, "a", "public-beta", "public-beta"),
+                             "1": self.snap(20, "b", "public-beta", "public-beta"),
+                             "2": self.snap(30, "c", "public", "public")}})
+        self.assertTrue(got[2])
+
+    def test_ranges_across_branches_are_left_to_steam(self):
+        # Steam keeps "a" here: it orders the branches, and this range doesn't cover the beta.
+        got = self.state({"timeupdated": 10, "manifest": "a"},
+                         {"latest_timeupdated": 20, "latest_manifest": "b", "author_snapshots": {
+                             "0": self.snap(10, "a", "public-beta", "public-beta"),
+                             "1": self.snap(20, "b", "public", "public-beta")}})
+        self.assertFalse(got[2])
+
+
+class TestSteamUpdate(unittest.TestCase):
+    """The waiting loop of an update, with Steam's answers scripted."""
+
+    def steam(self, states, refused=()):
+        from sts2mods import steamugc
+        s = steamugc._Steam.__new__(steamugc._Steam)
+        s.ugc = None
+        s.run_callbacks = lambda: None
+        s._download = lambda _ugc, wid, _high: str(wid) not in refused
+        # each item walks through its list of states, staying on the last one
+        s._state = lambda _ugc, wid: (states[str(wid)].pop(0) if len(states[str(wid)]) > 1
+                                      else states[str(wid)][0])
+        return s
+
+    def test_waits_for_every_item(self):
+        from sts2mods import steamugc as su
+        clock = [0.0]
+        tick = lambda _s: clock.__setitem__(0, clock[0] + 0.5)    # noqa: E731
+        s = self.steam({"1": [45, 61, 61, 5], "2": [45, 45, 45, 45, 61, 5], "3": [45, 13], "4": [13]},
+                       refused={"4"})
+        with mock.patch.object(su.time, "time", lambda: clock[0]):
+            res = s.update(["1", "2", "3", "4"], sleep=tick)
+        self.assertEqual({w: r["ok"] for w, r in res.items()},
+                         {"1": True, "2": True, "3": False, "4": False})
+        self.assertIn("couldn't download", res["3"]["error"])
+        self.assertIn("refused", res["4"]["error"])
+
+    def test_gives_up_on_a_stalled_download(self):
+        from sts2mods import steamugc as su
+        clock = [0.0]
+        tick = lambda _s: clock.__setitem__(0, clock[0] + 10)     # noqa: E731
+        s = self.steam({"1": [61]})
+        with mock.patch.object(su.time, "time", lambda: clock[0]):
+            res = s.update(["1"], stall=60, sleep=tick)
+        self.assertFalse(res["1"]["ok"])
+        self.assertIn("in time", res["1"]["error"])
+        self.assertLess(clock[0], 200)
+
+
 class TestWorkshopBrowse(unittest.TestCase):
     def test_query_item_id(self):
         self.assertEqual(workshop.query_item_id("3776911445"), "3776911445")

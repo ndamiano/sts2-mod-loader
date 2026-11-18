@@ -85,8 +85,12 @@ folder in Applications once. The app tells you if this is needed.
   longer names breaks. The app detects this and offers to move the game's data folder,
   saves included, to `/srv/sts2-mod-loader/<you>/` on the normal disk, linked back so the
   game finds it as before. It asks for your password once to create that folder.
-- **Workshop info.** Preview art, tags, subscriber counts and descriptions, plus a
-  badge when Steam has a newer version queued.
+- **Update all mods.** Steam only downloads mod updates when it gets round to it, usually
+  as the game starts. When mods have a newer version on the Workshop, they get an *update
+  available* badge and an **Update N mods** button appears (also *Update all mods* in the •••
+  menu, which checks the Workshop first). It has Steam download them all right away, and the
+  mods are health-checked again when the downloads finish: handy after a game update breaks half your list.
+- **Workshop info.** Preview art, tags, subscriber counts and descriptions.
 - **Play** launches the game through Steam (offering to apply pending changes first).
   When the game exits, the logs are rescanned automatically.
 
@@ -128,6 +132,8 @@ real settings.
 - Subscribing needs Steam running and signed in. While a request is sent (a second or
   two), Steam shows you as playing Slay the Spire 2. If the game's Steam library can't be
   found, Subscribe falls back to opening the Workshop page in Steam.
+- Updating needs Steam running too. Steam shows you as playing Slay the Spire 2 until the
+  downloads finish, so start the game after that.
 - *Get mods* reads Steam's public browse page. If Steam redesigns that page, browsing may
   stop finding results until the app is updated; pasting an item link or ID still works.
 - Some mods ship several builds for different game versions and pick one at runtime.

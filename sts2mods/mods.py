@@ -48,12 +48,10 @@ class Mod:
     size: int = 0
     installed_time: int = 0          # workshop timeupdated of installed files
     latest_time: int = 0             # workshop latest_timeupdated known to Steam
+    update_pending: bool = False     # Steam has a newer version for this game branch waiting
+    branch_versions: bool = False    # the author publishes separate versions per game branch
     shadowed: list = field(default_factory=list)   # other copies the game will NOT load
     static_issues: list = field(default_factory=list)
-
-    @property
-    def update_pending(self):
-        return bool(self.latest_time and self.installed_time and self.latest_time > self.installed_time)
 
     @property
     def source_label(self):
@@ -124,24 +122,55 @@ def _make_mod(path, data, source, workshop_id):
     )
 
 
-def _workshop_times(acf_path):
+def _snapshot_fits(snap, branch):
+    """Whether an author's snapshot of a Workshop item is offered to this game branch. Authors
+    can publish separate versions per branch, each with a lowest and highest branch ("" = no
+    limit). Steam knows the order of the branches and this app doesn't, so a range between two
+    different branches, or one that stops at another branch, is left to Steam: such a mod is
+    never reported as having an update waiting, which beats reporting one that won't come."""
+    lo, hi = snap.get("game_branch_min") or "", snap.get("game_branch_max") or ""
+    return {lo, hi} <= {"", branch}
+
+
+def workshop_state(acf_path, branch="public"):
+    """What Steam's record of the game's Workshop items says about each one:
+    {workshop id: (installed time, newest time, update waiting, has per-branch versions)}.
+
+    An update is waiting when the version Steam would install for this game branch isn't the
+    installed one. The newest upload alone doesn't say that: it may be for another branch."""
     if not acf_path or not os.path.exists(acf_path):
-        return {}, {}
+        return {}
     try:
         data = vdf.load(acf_path).get("AppWorkshop", {})
     except OSError:
-        return {}, {}
-    installed = {k: int(v.get("timeupdated", 0) or 0)
-                 for k, v in (data.get("WorkshopItemsInstalled") or {}).items() if isinstance(v, dict)}
-    latest = {k: int(v.get("latest_timeupdated", 0) or 0)
-              for k, v in (data.get("WorkshopItemDetails") or {}).items() if isinstance(v, dict)}
-    return installed, latest
+        return {}
+    details = data.get("WorkshopItemDetails") or {}
+    out = {}
+    for wid, inst in (data.get("WorkshopItemsInstalled") or {}).items():
+        if not isinstance(inst, dict):
+            continue
+        det = details.get(wid) if isinstance(details.get(wid), dict) else {}
+        installed, latest = int(inst.get("timeupdated", 0) or 0), int(det.get("latest_timeupdated", 0) or 0)
+        have = inst.get("manifest")
+        snaps = [v for v in (det.get("author_snapshots") or {}).values() if isinstance(v, dict)]
+        branched = any(v.get("game_branch_min") or v.get("game_branch_max") for v in snaps)
+        if branched:
+            fits = [v for v in snaps if _snapshot_fits(v, branch)]
+            want = max(fits, key=lambda v: int(v.get("timeupdated", 0) or 0)).get("manifest") if fits else have
+        else:
+            want = det.get("latest_manifest")
+        if have and want:
+            waiting = want != have
+        else:                               # older records without manifests
+            waiting = bool(latest and installed and latest > installed)
+        out[wid] = (installed, latest, waiting, branched)
+    return out
 
 
 def scan(game):
     """Return {mod_id: Mod} for the copy of each mod the game would actually load."""
     found = []
-    installed_t, latest_t = _workshop_times(game.workshop_acf)
+    steam = workshop_state(game.workshop_acf, game.branch)
     if game.workshop_dir and os.path.isdir(game.workshop_dir):
         for wid in sorted(os.listdir(game.workshop_dir)):
             item = os.path.join(game.workshop_dir, wid)
@@ -150,8 +179,8 @@ def scan(game):
             for path, data in _read_manifests(item):
                 mod = _make_mod(path, data, WORKSHOP, wid)
                 mod.size = _dir_size(item)
-                mod.installed_time = installed_t.get(wid, 0)
-                mod.latest_time = latest_t.get(wid, 0)
+                mod.installed_time, mod.latest_time, mod.update_pending, mod.branch_versions = \
+                    steam.get(wid, (0, 0, False, False))
                 found.append(mod)
     if game.mods_dir and os.path.isdir(game.mods_dir):
         for path, data in _read_manifests(game.mods_dir):

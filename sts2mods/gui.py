@@ -224,6 +224,19 @@ class State:
     def workshop_info(self, mod):
         return self.workshop.get(mod.workshop_id) if mod.workshop_id else None
 
+    def update_available(self, mod):
+        """True when the Workshop has newer files than the installed ones: Steam has the update
+        queued, or the Workshop's own page says so before Steam has noticed."""
+        if mod.update_pending:
+            return True
+        if mod.branch_versions:       # the newest upload may be for another branch: trust Steam
+            return False
+        newest = (self.workshop_info(mod) or {}).get("time_updated", 0)
+        return bool(mod.installed_time and newest > mod.installed_time)
+
+    def updatable(self):
+        return [m for m in self.mods.values() if m.workshop_id and self.update_available(m)]
+
     def mod_for_workshop(self, wid):
         return next((m for m in self.mods.values() if m.workshop_id == wid), None)
 
@@ -738,16 +751,22 @@ class ModRow(Row):
         if mod.author:
             parts.append(f"by {mod.author}")
         self.sub.configure(text=" · ".join(parts))
-        for c in self.badges.winfo_children():
-            c.destroy()
+        want = []
         if self.mod_id in st.pending:
-            badge(self.badges, "will enable" if st.pending[self.mod_id] else "will disable", "accent") \
-                .pack(side="left", padx=(4, 0))
-        if mod.update_pending:
-            badge(self.badges, "update queued", "ok").pack(side="left", padx=(4, 0))
+            want.append(("will enable" if st.pending[self.mod_id] else "will disable", "accent"))
+        if mod.workshop_id in self.win.updating and st.update_available(mod):
+            want.append(("updating…", "accent"))
+        elif st.update_available(mod):
+            want.append(("update available", "ok"))
         if mods_mod.is_library(st.mods, self.mod_id):
-            badge(self.badges, "library").pack(side="left", padx=(4, 0))
-        self.bind_all_children()
+            want.append(("library", "neutral"))
+        if want != getattr(self, "_badges", None):      # most refreshes change no badge: don't flicker
+            self._badges = want
+            for c in self.badges.winfo_children():
+                c.destroy()
+            for text, kind in want:
+                badge(self.badges, text, kind).pack(side="left", padx=(4, 0))
+            self.bind_all_children()
         self.paint()
 
 
@@ -775,11 +794,13 @@ class Window:
         self.health_gen = 0
         self.running = game_mod.is_running()
         self.subscribing, self.downloading = set(), set()
+        self.updating = set()        # Workshop ids Steam is downloading a newer version of
         self._toast_job = None
         self.cpu = Worker("health-check")
         self.net = Worker("workshop")
         self.pictures = WorkerPool("pictures", 6)   # Workshop previews, several at a time
         self.steam = Worker("steam")
+        self.steam_updates = Worker("steam-updates")   # long downloads; don't hold up Subscribe
         self.workshop_sig = self._workshop_signature()
 
         install_wheel(root)
@@ -921,6 +942,9 @@ class Window:
         self.broken_btn = Pill(bar, "", self.disable_broken, "danger",
                                tooltip="Mark every enabled mod that looks broken to be disabled. "
                                        "Nothing is written until you Apply.")
+        self.update_btn = Pill(bar, "", self.update_all, "primary",
+                               tooltip="Have Steam download the newest version of every mod that "
+                                       "has an update waiting")
         self.fix_btn = Pill(bar, "", self.fix_all, "secondary",
                             tooltip="Apply the automatic fixes the health check found "
                                     "(for example, misnamed files)")
@@ -945,6 +969,7 @@ class Window:
             ("Open game logs folder", lambda: self.state.game.logs_dir and
              game_mod.open_path(self.state.game.logs_dir)),
             ("Open local mods folder", self.open_mods_folder),
+            ("Update all mods", lambda: self.update_all(check=True)),
             ("Refresh", self.reload, "F5"),
             ("About", self.about),
         ])
@@ -1060,9 +1085,18 @@ class Window:
     # ---- population / refresh ------------------------------------------------------------
 
     def populate(self):
-        for r in self.rows.values():
+        # Keep the rows of mods that are still there: rebuilding all of them makes the whole
+        # list flash, and after a rescan most mods are the same.
+        old, self.rows = self.rows, {}
+        for mid in self.state.mods:
+            row = old.pop(mid, None)
+            if row:
+                row.refresh()
+            else:
+                row = ModRow(self, self.list.body, mid)
+            self.rows[mid] = row
+        for r in old.values():
             r.destroy()
-        self.rows = {mid: ModRow(self, self.list.body, mid) for mid in self.state.mods}
         self.refilter()
         self.refresh_chrome()
         if self.selected in self.rows:
@@ -1096,7 +1130,13 @@ class Window:
         self.summary.configure(text=f"{warns} enabled with warnings" if warns else "", fg=C["dim"])
         broken = counts.get(S_ERROR, 0)
         fixable = sum(1 for m in st.mods.values() for i in m.static_issues if i.fix)
-        for btn, n, text in ((self.broken_btn, broken, f"Disable {plural(broken, 'broken mod')}"),
+        updates = len(st.updatable())
+        busy = bool(self.updating)
+        self.update_btn.set_enabled(not busy)
+        for btn, n, text in ((self.update_btn, updates or busy,
+                              f"Updating {plural(updates, 'mod')}…" if busy else
+                              f"Update {plural(updates, 'mod')}"),
+                             (self.broken_btn, broken, f"Disable {plural(broken, 'broken mod')}"),
                              (self.fix_btn, fixable, f"Apply {plural(fixable, 'fix', 'es')}")):
             if n:
                 btn.set_text(text)
@@ -1194,14 +1234,20 @@ class Window:
 
         self.cpu.submit(work, done)
 
-    def start_workshop_fetch(self, force=False):
+    def start_workshop_fetch(self, force=False, then=None):
         ids = [m.workshop_id for m in self.state.mods.values() if m.workshop_id]
 
         def done(info):
+            before = {m.id for m in self.state.updatable()}
             self.state.workshop.update(info)
             self.sync_certificate_notice()
+            changed = before ^ {m.id for m in self.state.updatable()}
+            if changed:                    # the Workshop knows of updates Steam hasn't queued yet
+                self.refresh_rows(changed)
             if self.selected:
                 self.show_details(self.selected, keep_scroll=True)
+            if then:
+                then()
 
         self.net.submit(lambda: workshop.fetch_details(ids, force=force), done)
 
@@ -1227,7 +1273,16 @@ class Window:
                 self.refresh_chrome()
         sig = self._workshop_signature()
         if sig != self.workshop_sig:
-            self._on_workshop_changed(self.workshop_sig[0], sig[0])
+            if self.updating:
+                # Steam rewrites its Workshop records constantly while it downloads. A full
+                # rescan and health check each time would keep the whole machine busy, so
+                # only tick off the mods that have arrived; update_all rescans once at the end.
+                self.workshop_sig = sig
+                self._note_update_progress()
+            elif sig[0] != self.workshop_sig[0] or self._workshop_times_changed():
+                self._on_workshop_changed(self.workshop_sig[0], sig[0])
+            else:
+                self.workshop_sig = sig     # Steam rewrote its records, but no mod changed
         self.root.after(2000, self._poll)
 
     def _workshop_signature(self):
@@ -1255,6 +1310,31 @@ class Window:
                        ". New mods are enabled; press Play or check them under My mods.")
         elif gone:
             self.toast(f"{plural(len(gone), 'Workshop item')} removed by Steam. Rescanned.")
+
+    def _workshop_times_changed(self):
+        """True when Steam's records show different installed or newest versions than the list."""
+        g = self.state.game
+        steam = mods_mod.workshop_state(g.workshop_acf, g.branch)
+        return any(steam.get(m.workshop_id, (0, 0, False, False)) !=
+                   (m.installed_time, m.latest_time, m.update_pending, m.branch_versions)
+                   for m in self.state.mods.values() if m.workshop_id)
+
+    def _note_update_progress(self):
+        st = self.state
+        steam = mods_mod.workshop_state(st.game.workshop_acf, st.game.branch)
+        changed = []
+        for m in st.mods.values():
+            if m.workshop_id not in self.updating or m.workshop_id not in steam:
+                continue
+            was = st.update_available(m)
+            m.installed_time, m.latest_time, m.update_pending, m.branch_versions = steam[m.workshop_id]
+            if st.update_available(m) != was:
+                changed.append(m.id)
+        for mid in changed:
+            if mid in self.rows:
+                self.rows[mid].refresh()
+        if changed:
+            self.refresh_chrome()
 
     def is_installed(self, wid):
         g = self.state.game
@@ -1321,6 +1401,63 @@ class Window:
             except steamugc.SteamError as e:
                 return e
         self.steam.submit(work, done)
+
+    # ---- updating ------------------------------------------------------------------------
+
+    def update_all(self, check=False):
+        """Have Steam download every waiting mod update now. Steam otherwise fetches them when it
+        next updates the game's Workshop items, usually as the game starts. With check, ask the
+        Workshop for the latest versions first (the menu item: there may be nothing known yet)."""
+        if self.updating:
+            self.toast(f"Steam is already updating {plural(len(self.updating), 'mod')}.")
+            return
+        if check:
+            self.toast("Checking the Workshop for updates…")
+            self.start_workshop_fetch(force=True, then=self.update_all)
+            return
+        mods = self.state.updatable()
+        if not mods:
+            self.toast("Every mod is up to date.")
+            return
+        game = self.state.game
+        if not steamugc.available(game):
+            self.error("Couldn't update", "Steam's library wasn't found in the game folder, so this "
+                       "app can't ask Steam to download. Steam updates mods by itself when the game starts.")
+            return
+        wids = sorted({m.workshop_id for m in mods})
+        names = {}
+        for m in mods:
+            names.setdefault(m.workshop_id, m.name)
+        self.updating = set(wids)
+        self.refresh_rows([m.id for m in mods])
+        self.toast(f"Asked Steam to update {plural(len(mods), 'mod')}. They're rechecked when the "
+                   "downloads finish; Steam shows the game as running meanwhile.")
+
+        def done(result):
+            self.updating.clear()
+            self.reload(quiet=True)
+            self.start_workshop_fetch()
+            if isinstance(result, Exception):
+                self.error("Couldn't update", f"Steam said: {result}.\n\nSteam also updates mods by "
+                           "itself when the game starts.")
+                return
+            ok = [w for w in wids if result.get(w, {}).get("ok")]
+            bad = {w: result.get(w, {}).get("error", "failed") for w in wids if w not in ok}
+            if ok:
+                left = len(self.state.updatable())
+                self.toast(f"Updated {plural(len(ok), 'Workshop item')}." +
+                           (" Restart the game to use them." if self.running else "") +
+                           (f" {plural(left, 'mod')} still to update." if left and not bad else ""))
+            if bad:
+                self.error("Some updates failed",
+                           "\n".join(f"• {names[w]}: {e}" for w, e in bad.items()))
+
+        def work():
+            try:
+                return steamugc.update(game, wids)
+            except steamugc.SteamError as e:
+                return e
+        self.steam_updates.submit(work, done)
 
     def unsubscribe(self, wid, name):
         mod = self.state.mod_for_workshop(wid)
@@ -1540,7 +1677,9 @@ class Window:
         ]
         if mod.installed_time:
             facts.append(("Installed update", fmt_time(mod.installed_time) +
-                          ("  (newer version queued in Steam)" if mod.update_pending else "")))
+                          ("" if not st.update_available(mod) else
+                           "  (Steam is downloading a newer version)" if mod.workshop_id in self.updating
+                           else "  (newer version available)")))
         if info.get("subscriptions"):
             facts.append(("Subscribers", f"{info['subscriptions']:,}"))
         facts.append(("Load position", f"{st.order.index(mod_id) + 1} of {len(st.order)}"
@@ -1872,6 +2011,12 @@ class Window:
                 self.apply()
                 if self.state.change_count():
                     return
+        if self.updating and self.ask(
+                "Mods are still updating",
+                f"Steam is still downloading {plural(len(self.updating), 'mod update')}. Until that "
+                "finishes Steam sees the game as already running, and the game would start with the "
+                "old versions.", [("Wait", 0), ("Play anyway", 1)], default=0) != 1:
+            return
         game_mod.launch()
         self.toast("Starting Slay the Spire 2 through Steam…")
 

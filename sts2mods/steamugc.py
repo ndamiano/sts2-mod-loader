@@ -5,10 +5,13 @@ of Steam's API library that ships with Slay the Spire 2 and talks to the running
 as the game (app id 2868840). Steam downloads the item exactly as if you had clicked Subscribe
 on the Workshop page.
 
+Updating works the same way: Steam is asked to download the newest files of items that are
+already subscribed.
+
 Each request runs in a short-lived child process (this app started again with --steam-helper,
 which also works from the packaged Windows .exe): a crash in
 native code can't take the window down, and Steam only sees "playing Slay the Spire 2" for the
-second or two the request takes.
+second or two the request takes (for updates: until the downloads finish).
 """
 
 import ctypes
@@ -32,6 +35,10 @@ RESULT_SIZE = 16 if osenv.IS_WINDOWS else 12
 # Bits from ISteamUGC::GetItemState.
 STATE_SUBSCRIBED, STATE_INSTALLED, STATE_NEEDS_UPDATE = 1, 4, 8
 STATE_DOWNLOADING, STATE_DOWNLOAD_PENDING = 16, 32
+STATE_BUSY = STATE_DOWNLOADING | STATE_DOWNLOAD_PENDING
+
+# Updating: give up when nothing has finished or started for this long, or after this long in all.
+UPDATE_STALL, UPDATE_LIMIT = 300, 3600
 
 ERESULT_TEXT = {2: "Steam reported a generic failure", 3: "Steam is offline",
                 9: "the item doesn't exist or was removed", 15: "access denied (do you own the game?)",
@@ -133,6 +140,41 @@ class _Steam:
     def unsubscribe(self, wid):
         self._wait(self._unsubscribe(self.ugc, int(wid)), CB_UNSUBSCRIBE)
 
+    def update(self, wids, stall=UPDATE_STALL, limit=UPDATE_LIMIT, sleep=time.sleep):
+        """Have Steam fetch the newest files of subscribed items now, instead of whenever it next
+        gets round to the game's queued Workshop updates, and wait until it has. Steam drops
+        the request as soon as this process disconnects, so this stays until every item is
+        done. Returns {wid: {"ok": bool, "error"?: str, "state": int}}."""
+        results, waiting = {}, {}
+        for wid in wids:
+            if self._download(self.ugc, int(wid), True):
+                waiting[wid] = None
+            else:
+                results[wid] = {"ok": False, "state": self.state(wid),
+                                "error": "Steam refused the download (is the mod still subscribed?)"}
+        start = progress = time.time()
+        idle = {}                         # wid -> when Steam was first seen not working on it
+        while waiting:
+            self.run_callbacks()
+            now = time.time()
+            for wid in list(waiting):
+                state = self.state(wid)
+                if state != waiting[wid]:
+                    waiting[wid], progress = state, now
+                if state & STATE_BUSY:
+                    idle.pop(wid, None)
+                elif now - idle.setdefault(wid, now) >= 1:      # settled, not between two steps
+                    del waiting[wid]
+                    progress = now
+                    results[wid] = {"ok": True, "state": state} if not state & STATE_NEEDS_UPDATE else \
+                        {"ok": False, "state": state, "error": "Steam couldn't download the update"}
+            if now - progress > stall or now - start > limit:
+                break
+            sleep(0.1)
+        for wid, state in waiting.items():
+            results[wid] = {"ok": False, "state": state or 0, "error": "the download didn't finish in time"}
+        return results
+
     def state(self, wid):
         return int(self._state(self.ugc, int(wid)))
 
@@ -145,6 +187,9 @@ def _child(argv):
     except SteamError as e:
         return {"ok": False, "error": str(e)}
     try:
+        if action == "update":
+            out["results"] = steam.update(ids)
+            return out
         for wid in ids:
             try:
                 if action == "subscribe":
@@ -212,6 +257,12 @@ def subscribe(game, ids):
 
 def unsubscribe(game, ids):
     return _request("unsubscribe", game, ids)
+
+
+def update(game, ids):
+    """Blocking, for as long as the downloads take: has Steam download the newest version of each
+    subscribed item. Same return as subscribe()."""
+    return _request("update", game, ids, timeout=UPDATE_LIMIT + 60)
 
 
 def item_states(game, ids):

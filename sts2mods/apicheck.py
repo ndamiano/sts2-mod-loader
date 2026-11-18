@@ -17,7 +17,8 @@ from . import metadata as md, osenv
 from .game import parse_version
 
 CACHE_PATH = os.path.join(osenv.cache_dir(), "apicheck.json")
-CACHE_VERSION = 3
+CACHE_VERSION = 4
+NAMES_KEY = "//names"     # in the cache beside the mod ids: {dll path: [fingerprint, assembly name]}
 VERSION_DIR = re.compile(r"^[a-z]?v?(\d+\.\d+(?:\.\d+)?)$", re.I)
 VARIANT_SUFFIX = re.compile(r"\.(stable|beta\d*|public|legacy|v?\d+(?:[._]\d+)*)$", re.I)
 
@@ -105,9 +106,10 @@ def check_assembly(path, providers):
 
     for i in range(1, asm.count(md.TYPEREF) + 1):
         a = asm.typeref_assembly(i)
-        if a in providers:
+        prov = providers.get(a)
+        if prov:
             name = asm.typeref_name(i)
-            if name not in providers[a].types and ("missing-type", name) not in seen:
+            if name not in prov.types and ("missing-type", name) not in seen:
                 seen.add(("missing-type", name))
                 problems.append(Problem("missing-type", a, name))
 
@@ -211,50 +213,99 @@ def _find_game_dll(game):
 
 
 def check_mods(mods, game):
-    """Return {mod_id: ModApiResult}. Results are cached by file fingerprints."""
+    """Return {mod_id: ModApiResult}. Results are cached by file fingerprints.
+
+    A mod's result depends on its own DLLs and on the assemblies it refers to (the game, the
+    library mods it uses), and is redone only when one of those files changes. Updating one mod
+    therefore rechecks that mod and the mods built on it, not the whole list."""
     sts2_path = _find_game_dll(game)
     if not sts2_path:
         return {}
 
-    provider_paths = {"sts2": sts2_path}
-    for mod in mods.values():
-        primary = os.path.join(mod.dir, f"{mod.id}.dll")
-        if os.path.exists(primary):
-            provider_paths.setdefault(f"mod:{mod.id}", primary)
-
     cache = _load_cache()
-    providers = None
+    names = cache.setdefault(NAMES_KEY, {})
+    provider_paths = {}                 # assembly name -> the file that defines it
+    for path in [sts2_path] + [os.path.join(m.dir, f"{m.id}.dll") for m in mods.values()]:
+        if os.path.exists(path):
+            provider_paths.setdefault(_assembly_name(path, names), path)
+    for stale in [p for p in names if p not in provider_paths.values()]:
+        del names[stale]
+    providers = _Providers(provider_paths)
+
+    def fingerprint(paths, refs):
+        return _fingerprint(paths + sorted(provider_paths[r] for r in refs if r in provider_paths))
+
     results = {}
     for mod_id, mod in mods.items():
         primary, groups = _variant_groups(mod, game.version)
         all_paths = ([primary] if primary else []) + [p for g in groups.values() for p in g]
         if not all_paths:
             continue
-        fp = _fingerprint(all_paths + sorted(provider_paths.values()))
         hit = cache.get(mod_id)
-        if hit and hit.get("fp") == fp:
+        if hit and hit.get("fp") == fingerprint(all_paths, hit.get("refs", [])):
             results[mod_id] = ModApiResult([Problem(**p) for p in hit["problems"]], hit["checked"], hit.get("error", ""))
             continue
-        if providers is None:
-            providers = _load_providers(provider_paths)
+        refs = sorted({r for p in all_paths for r in _references(p)})
         result = _check_mod(mod_id, primary, groups, providers)
         results[mod_id] = result
-        cache[mod_id] = {"fp": fp, "problems": [p.__dict__ for p in result.problems],
+        cache[mod_id] = {"fp": fingerprint(all_paths, refs), "refs": refs,
+                         "problems": [p.__dict__ for p in result.problems],
                          "checked": result.checked, "error": result.error}
     _save_cache(cache)
     return results
 
 
-def _load_providers(provider_paths):
-    providers = {}
-    for key, path in provider_paths.items():
+def _assembly_name(path, names):
+    """The name other assemblies refer to this file by. Remembered per file, so that finding
+    out which files matter to a mod doesn't mean reading all of them every time."""
+    fp = _fingerprint([path])
+    hit = names.get(path)
+    if not hit or hit[0] != fp:
         try:
-            prov = build_provider(path)
+            name = md.Assembly(path).name
         except (md.BadImage, OSError, ValueError):
-            continue
-        if key == "sts2" or prov.name not in providers:
-            providers[prov.name] = prov
-    return providers
+            name = None
+        hit = names[path] = [fp, name or os.path.splitext(os.path.basename(path))[0]]
+    return hit[1]
+
+
+def _references(path):
+    """Names of the assemblies a DLL refers to."""
+    try:
+        asm = md.Assembly(path)
+        return {asm.row(md.ASSEMBLYREF, i)["Name"] for i in range(1, asm.count(md.ASSEMBLYREF) + 1)}
+    except (md.BadImage, OSError, ValueError):
+        return set()
+
+
+class _Providers:
+    """Provider assemblies by name, each read the first time a mod needs it."""
+
+    def __init__(self, paths):
+        self.paths, self.loaded = paths, {}
+
+    def get(self, name):
+        if name not in self.loaded:
+            prov = None
+            if name in self.paths:
+                try:
+                    prov = build_provider(self.paths[name])
+                except (md.BadImage, OSError, ValueError):
+                    pass
+            self.loaded[name] = prov
+        return self.loaded[name]
+
+    def without(self, name):
+        """This set minus one assembly: a mod isn't checked against itself."""
+        return _Without(self, name)
+
+
+class _Without:
+    def __init__(self, providers, name):
+        self.providers, self.name = providers, name
+
+    def get(self, name):
+        return None if name == self.name else self.providers.get(name)
 
 
 def _check_mod(mod_id, primary, groups, providers):
@@ -262,8 +313,7 @@ def _check_mod(mod_id, primary, groups, providers):
         own_name = None
         try:
             own_name = md.Assembly(path).name
-            usable = {k: v for k, v in providers.items() if k != own_name}
-            return check_assembly(path, usable)
+            return check_assembly(path, providers.without(own_name))
         except (md.BadImage, OSError, ValueError) as e:
             raise RuntimeError(str(e))
 
