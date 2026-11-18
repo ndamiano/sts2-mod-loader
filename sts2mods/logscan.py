@@ -371,6 +371,30 @@ def parse_log(path, mods, attributor):
     return session
 
 
+_PARSED = {}       # log path -> (what it was parsed from, LogSession)
+
+
+def _parse_logs(paths, mods):
+    """parse_log for each file, reusing the result while the file and the installed mods are
+    the same. Logs run to tens of megabytes and only the newest one changes between checks."""
+    installed = tuple(sorted((m.id, m.version, m.dir) for m in mods.values()))
+    attributor, sessions = None, []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            key = (st.st_size, st.st_mtime_ns, installed)
+        except OSError:
+            key = None
+        hit = _PARSED.get(path)
+        if key is None or not hit or hit[0] != key:
+            attributor = attributor or Attributor(mods)
+            hit = _PARSED[path] = (key, parse_log(path, mods, attributor))
+        sessions.append(hit[1])
+    for gone in set(_PARSED) - set(paths):
+        del _PARSED[gone]
+    return sessions
+
+
 def log_files(logs_dir):
     if not logs_dir or not os.path.isdir(logs_dir):
         return []
@@ -451,8 +475,7 @@ def analyze(mods, logs_dir, live=False, use_history=True, api_results=None, game
             game=None):
     """live=True means the newest log belongs to a session that is still running. game (optional)
     lets long-file-name errors offer a fix."""
-    attributor = Attributor(mods)
-    sessions = [parse_log(p, mods, attributor) for p in log_files(logs_dir)]
+    sessions = _parse_logs(log_files(logs_dir), mods)
     history = _load_history() if use_history else {}
     history_changed = False
     by_mod, status, tested = {}, {}, {}

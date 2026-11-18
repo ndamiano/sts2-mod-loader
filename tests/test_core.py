@@ -434,6 +434,27 @@ class TestWorkshopState(Sandbox):
         self.assertFalse(got[2])
 
 
+class TestInputMethod(unittest.TestCase):
+    def test_follows_the_session_language_unless_told(self):
+        from sts2mods import osenv
+        self.assertFalse(osenv.wants_input_method({"LANG": "en_US.UTF-8"}))
+        self.assertTrue(osenv.wants_input_method({"LANG": "zh_CN.UTF-8"}))
+        self.assertTrue(osenv.wants_input_method({"LANG": "en_US.UTF-8", "LC_CTYPE": "ja_JP.UTF-8"}))
+        self.assertTrue(osenv.wants_input_method({"LANG": "en_US.UTF-8", "STS2ML_INPUT_METHOD": "on"}))
+        self.assertFalse(osenv.wants_input_method({"LANG": "zh_CN.UTF-8", "STS2ML_INPUT_METHOD": "off"}))
+
+    def test_setting_is_put_back(self):
+        from sts2mods import osenv
+        with mock.patch.dict(os.environ, {"XMODIFIERS": "@im=ibus", "LANG": "en_US.UTF-8"}), \
+                mock.patch.object(osenv, "IS_LINUX", True):
+            os.environ.pop("STS2ML_INPUT_METHOD", None)
+            os.environ.pop("LC_ALL", None)
+            os.environ.pop("LC_CTYPE", None)
+            with osenv.fast_text_input():
+                self.assertEqual(os.environ["XMODIFIERS"], "@im=none")
+            self.assertEqual(os.environ["XMODIFIERS"], "@im=ibus")
+
+
 class TestSteamUpdate(unittest.TestCase):
     """The waiting loop of an update, with Steam's answers scripted."""
 

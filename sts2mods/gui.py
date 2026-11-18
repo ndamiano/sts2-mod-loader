@@ -99,18 +99,23 @@ class Worker:
         self.jobs = queue.Queue()
         threading.Thread(target=self._run, name=name, daemon=True).start()
 
-    def submit(self, fn, callback):
-        self.jobs.put((fn, callback))
+    def submit(self, fn, callback, on_error=None):
+        """Run fn on the thread, then callback(result) on the main loop. If fn raises,
+        on_error(exception) is called there instead, so whatever was waiting for the result
+        (a spinner, a disabled button) can be put back."""
+        self.jobs.put((fn, callback, on_error))
 
     def _run(self):
         while True:
-            fn, callback = self.jobs.get()
+            fn, callback, on_error = self.jobs.get()
             if Worker.closing:
                 continue
             try:
                 result = fn()
             except Exception as e:   # a bug in one job must not kill the worker
                 print(f"background job failed: {e!r}", file=sys.stderr)
+                if on_error and not Worker.closing:
+                    Worker.results.put((on_error, e))
                 continue
             if not Worker.closing:
                 Worker.results.put((callback, result))
@@ -140,8 +145,8 @@ class WorkerPool:
         self.workers = [Worker(f"{name}-{i}") for i in range(size)]
         self.next = 0
 
-    def submit(self, fn, callback):
-        self.workers[self.next].submit(fn, callback)
+    def submit(self, fn, callback, on_error=None):
+        self.workers[self.next].submit(fn, callback, on_error)
         self.next = (self.next + 1) % len(self.workers)
 
 
@@ -801,6 +806,7 @@ class Window:
         self.pictures = WorkerPool("pictures", 6)   # Workshop previews, several at a time
         self.steam = Worker("steam")
         self.steam_updates = Worker("steam-updates")   # long downloads; don't hold up Subscribe
+        self.poller = Worker("poll")
         self.workshop_sig = self._workshop_signature()
 
         install_wheel(root)
@@ -1232,7 +1238,11 @@ class Window:
             self.spinner.stop()
             self.refresh_rows()
 
-        self.cpu.submit(work, done)
+        def failed(_e):
+            if gen == self.health_gen:
+                self.spinner.stop()
+
+        self.cpu.submit(work, done, failed)
 
     def start_workshop_fetch(self, force=False, then=None):
         ids = [m.workshop_id for m in self.state.mods.values() if m.workshop_id]
@@ -1263,7 +1273,11 @@ class Window:
             self.refresh_chrome()
 
     def _poll(self):
-        running = game_mod.is_running()
+        # Off the main loop: on Windows and macOS the check starts a program each time.
+        again = lambda _e: self.root.after(2000, self._poll)      # noqa: E731
+        self.poller.submit(game_mod.is_running, self._polled, again)
+
+    def _polled(self, running):
         if running != self.running:
             self.running = running
             if not running:
@@ -1396,11 +1410,8 @@ class Window:
                            "\n".join(f"• {label(w)}: {e}" for w, e in bad.items()))
 
         def work():
-            try:
-                return steamugc.subscribe(game, wids)
-            except steamugc.SteamError as e:
-                return e
-        self.steam.submit(work, done)
+            return steamugc.subscribe(game, wids)
+        self.steam.submit(work, done, done)
 
     # ---- updating ------------------------------------------------------------------------
 
@@ -1453,11 +1464,8 @@ class Window:
                            "\n".join(f"• {names[w]}: {e}" for w, e in bad.items()))
 
         def work():
-            try:
-                return steamugc.update(game, wids)
-            except steamugc.SteamError as e:
-                return e
-        self.steam_updates.submit(work, done)
+            return steamugc.update(game, wids)
+        self.steam_updates.submit(work, done, done)
 
     def unsubscribe(self, wid, name):
         mod = self.state.mod_for_workshop(wid)
@@ -1480,11 +1488,8 @@ class Window:
                        + (" (after the game closes)." if self.running else "."))
 
         def work():
-            try:
-                return steamugc.unsubscribe(game, [wid])
-            except steamugc.SteamError as e:
-                return e
-        self.steam.submit(work, done)
+            return steamugc.unsubscribe(game, [wid])
+        self.steam.submit(work, done, done)
 
     # ---- filtering / sorting -------------------------------------------------------------
 
@@ -2479,7 +2484,8 @@ def run():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except (AttributeError, OSError):
             pass
-    root = tk.Tk(className="sts2-mod-loader")
+    with osenv.fast_text_input():
+        root = tk.Tk(className="sts2-mod-loader")
     # Dark by default everywhere; STS2ML_THEME=light (or =auto to follow the desktop) overrides it.
     theme = os.environ.get("STS2ML_THEME", "dark").lower()
     apply_theme(root, dark=None if theme == "auto" else theme != "light")

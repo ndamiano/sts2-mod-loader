@@ -12,6 +12,11 @@ pictures can't be shown: the *Get mods* page says so when that happens.
 Dark theme by default. Set `STS2ML_THEME=light` for light, or `STS2ML_THEME=auto` to follow
 the desktop.
 
+On Linux the window opens without the desktop's input method (ibus, fcitx) unless your
+session language needs one to type (Chinese, Japanese, Korean…): asking it about every widget
+made the window take seconds to appear. Dead keys and Compose still work. Set
+`STS2ML_INPUT_METHOD=on` to type with an input method anyway, or `=off` to never use one.
+
 ## Install
 
 **Linux**

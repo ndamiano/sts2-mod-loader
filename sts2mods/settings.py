@@ -119,5 +119,8 @@ def restore_backup(backup, path):
     with open(backup, "rb") as f:
         content = f.read()   # read first: making a new backup may prune this one
     make_backup(path)
-    with open(path, "wb") as f:
+    tmp = path + ".sts2ml.tmp"          # never leave the game a half-written settings file
+    with open(tmp, "wb") as f:
         f.write(content)
+    shutil.copymode(path, tmp)
+    os.replace(tmp, path)

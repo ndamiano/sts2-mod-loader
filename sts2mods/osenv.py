@@ -223,3 +223,47 @@ def ssl_context():
     if _SSL_CONTEXT is None:
         _SSL_CONTEXT = ssl.create_default_context()
     return _SSL_CONTEXT
+
+
+# ---- input methods (Linux) ----------------------------------------------------------------
+
+IME_LANGUAGES = ("zh", "ja", "ko", "vi", "th", "hi", "bn", "ta", "te", "ml", "kn", "gu", "pa", "mr",
+                 "ne", "si", "km", "lo", "my", "am", "ti")
+
+
+def wants_input_method(env=None):
+    """Whether typing here should go through the desktop's input method (ibus, fcitx).
+
+    Tk asks the input method for a separate input context for every widget, a round trip of
+    several milliseconds each. With a thousand widgets in the mod list that made the window
+    take seconds to appear (ten, with a slow ibus), so it is only worth it for people who need
+    one to type: STS2ML_INPUT_METHOD=on/off decides, otherwise the language of the session."""
+    env = os.environ if env is None else env
+    choice = env.get("STS2ML_INPUT_METHOD", "").lower()
+    if choice in ("on", "1", "yes", "true"):
+        return True
+    if choice in ("off", "0", "no", "false"):
+        return False
+    lang = env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG") or ""
+    return lang[:2].lower() in IME_LANGUAGES
+
+
+class fast_text_input:
+    """`with fast_text_input(): root = tk.Tk()` on Linux: unless an input method is wanted, Tk
+    opens the display with X's built-in one (dead keys and Compose still work). The setting is
+    read when the display is opened and put back straight after, so programs started from here
+    (the file manager, Steam) are not affected."""
+
+    def __enter__(self):
+        self.changed = IS_LINUX and not wants_input_method()
+        if self.changed:
+            self.old = os.environ.get("XMODIFIERS")
+            os.environ["XMODIFIERS"] = "@im=none"
+
+    def __exit__(self, *exc):
+        if self.changed:
+            if self.old is None:
+                os.environ.pop("XMODIFIERS", None)
+            else:
+                os.environ["XMODIFIERS"] = self.old
+
